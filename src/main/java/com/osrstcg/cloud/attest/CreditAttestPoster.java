@@ -4,11 +4,12 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.osrstcg.cloud.api.CloudApiClient;
 import com.osrstcg.cloud.api.CloudApiException;
+import com.osrstcg.cloud.api.CloudResponseSync;
+import com.osrstcg.cloud.api.JsonObjects;
 import java.io.IOException;
 import java.util.List;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
-
 /**
  * Sends one coalesced batch of credit events to the cloud attest endpoint and applies the response:
  * clears optimistic credits, requeues fixable rejects, updates sidebar economy stats, and forces a
@@ -27,8 +28,7 @@ final class CreditAttestPoster
 		this.api = api;
 		this.requeuer = requeuer;
 	}
-
-	/**
+/**
 	 * Posts {@code batch} to the attest API, requeues any rejected-but-fixable events, clears optimistic
 	 * credits for what the server accepted, and applies any economy/revision changes from the response.
 	 *
@@ -68,7 +68,6 @@ final class CreditAttestPoster
 		JsonObject response = api.attest(body);
 		queue.noteAttestAfterMs(response);
 		AttestRejectRequeuer.RequeueResult requeueResult = requeuer.requeueRejectedEvents(response, batch);
-		queue.rateCapNotifier.onAttestResponse(response);
 		queue.session.noteAttestBanFlags(response);
 
 		long clearOptimistic = CreditAttestQueue.resolveOptimisticClearAmount(
@@ -83,11 +82,12 @@ final class CreditAttestPoster
 		boolean changed = false;
 		boolean appliedEconomy = false;
 
-		if (response.has("credits") || response.has("openedPacks") || response.has("totalCreditsGained"))
+		if (CloudResponseSync.hasEconomyFields(response))
 		{
-			long serverCredits = response.has("credits")
-				? response.get("credits").getAsLong()
-				: queue.stateService.getAuthoritativeCredits();
+			Double creditsNum = JsonObjects.readNumber(response, "credits");
+			long serverCredits = creditsNum == null
+				? queue.stateService.getAuthoritativeCredits()
+				: Math.round(creditsNum);
 			log.debug(
 				"Credit attest economy: serverCredits={} pendingBefore={} clearOptimistic={} pendingAfter={} rejected={}",
 				serverCredits,
@@ -95,7 +95,7 @@ final class CreditAttestPoster
 				clearOptimistic,
 				queue.stateService.getPendingOptimisticCredits(),
 				CreditAttestQueue.formatRejectedReasons(response));
-			queue.session.applySidebarStats(response);
+			CloudResponseSync.applyEconomyFields(response, queue.session::applySidebarStats);
 			appliedEconomy = true;
 			if (queue.stateService.getCredits() != creditsBefore)
 			{
@@ -107,15 +107,36 @@ final class CreditAttestPoster
 			log.debug("Credit attest rejected without economy payload: {}", requeueResult.reasons);
 		}
 
-		if (response.has("revision") && !response.get("revision").isJsonNull())
+		Double revision = JsonObjects.readNumber(response, "revision");
+		if (revision != null)
 		{
-			long revision = response.get("revision").getAsLong();
-			if (revision != revisionBefore)
+			long rev = Math.round(revision);
+			if (rev != revisionBefore)
 			{
 				changed = true;
 			}
-			queue.tradeCloud.noteRevision(revision);
+			queue.tradeCloud.noteRevision(rev);
 		}
+
+		long rateCapAfterMs = CreditAttestQueue.parseRateCapAfterMs(response);
+		if (rateCapAfterMs > 0L)
+		{
+			try
+			{
+				queue.session.refreshCreditsFromServer(false);
+				appliedEconomy = true;
+				if (queue.stateService.getCredits() != creditsBefore)
+				{
+					changed = true;
+				}
+			}
+			catch (Exception syncEx)
+			{
+				log.debug("Credits sync before rate-cap pause failed", syncEx);
+			}
+			queue.noteRateCapAfterMs(response);
+		}
+		queue.rateCapNotifier.onAttestResponse(response);
 
 		if (appliedEconomy)
 		{
@@ -127,8 +148,7 @@ final class CreditAttestPoster
 		}
 		return changed;
 	}
-
-	/** True for transient I/O failures, server errors (5xx), or rate limiting — worth a retry flush. */
+/** True for transient I/O failures, server errors (5xx), or rate limiting — worth a retry flush. */
 	static boolean isRetryableAttestFailure(Throwable ex)
 	{
 		if (ex instanceof IOException && !(ex instanceof CloudApiException))

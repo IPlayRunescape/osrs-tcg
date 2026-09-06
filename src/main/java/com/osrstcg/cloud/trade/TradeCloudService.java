@@ -18,8 +18,9 @@ import net.runelite.client.util.LinkBrowser;
 import com.osrstcg.cloud.api.CloudApiClient;
 import com.osrstcg.cloud.api.CloudApiException;
 import com.osrstcg.cloud.api.CloudEndpoints;
+import com.osrstcg.cloud.api.CloudResponseSync;
+import com.osrstcg.cloud.api.JsonObjects;
 import com.osrstcg.cloud.session.CloudSessionService;
-
 /**
  * Manages player-to-player trading against the cloud API: sending trade requests and self-rescheduling
  * polling of the trade inbox, with backoff on errors. {@link #start()}/{@link #stop()} control the poll
@@ -41,7 +42,6 @@ public final class TradeCloudService
 	private final ChatMessageManager chatMessageManager;
 	private final ScheduledExecutorService scheduler;
 
-	private final AtomicReference<TradeInboxItem> pendingAccept = new AtomicReference<>(null);
 	private final AtomicReference<Runnable> inboxListener = new AtomicReference<>(null);
 	private final AtomicBoolean running = new AtomicBoolean(false);
 	private final AtomicBoolean polling = new AtomicBoolean(false);
@@ -52,8 +52,7 @@ public final class TradeCloudService
 	private final AtomicLong backoffMs = new AtomicLong(0L);
 	private final Object scheduleLock = new Object();
 	private ScheduledFuture<?> pollFuture;
-
-	/** Wires cloud/session collaborators and the executor used for network calls and polling. */
+/** Wires cloud/session collaborators and the executor used for network calls and polling. */
 	@Inject
 	TradeCloudService(
 		CloudApiClient api,
@@ -68,8 +67,7 @@ public final class TradeCloudService
 		this.chatMessageManager = chatMessageManager;
 		this.scheduler = scheduler;
 	}
-
-	/** Starts the inbox poll loop (idempotent) and resets revision/backoff state, forcing a login broadcast. */
+/** Starts the inbox poll loop (idempotent) and resets revision/backoff state, forcing a login broadcast. */
 	public void start()
 	{
 		synchronized (scheduleLock)
@@ -86,8 +84,7 @@ public final class TradeCloudService
 			scheduleNextLocked(0L);
 		}
 	}
-
-	/** Stops the inbox poll loop and cancels any scheduled poll. */
+/** Stops the inbox poll loop and cancels any scheduled poll. */
 	public void stop()
 	{
 		synchronized (scheduleLock)
@@ -100,8 +97,7 @@ public final class TradeCloudService
 			broadcastPendingOnLogin.set(false);
 		}
 	}
-
-	/**
+/**
 	 * Requests an immediate inbox poll, bypassing the current backoff/interval. If a poll is already in
 	 * flight, defers the extra poll until it finishes rather than running two concurrently.
 	 */
@@ -122,8 +118,7 @@ public final class TradeCloudService
 			scheduleNextLocked(0L);
 		}
 	}
-
-	/** Records the latest known trade-inbox revision, ignoring negative (unknown) values. */
+/** Records the latest known trade-inbox revision, ignoring negative (unknown) values. */
 	public void noteRevision(long revision)
 	{
 		if (revision >= 0L)
@@ -131,26 +126,17 @@ public final class TradeCloudService
 			lastRevision.set(revision);
 		}
 	}
-
-	/** @return the last known trade-inbox revision, or -1 if none has been observed yet */
+/** @return the last known trade-inbox revision, or -1 if none has been observed yet */
 	public long getLastRevision()
 	{
 		return lastRevision.get();
 	}
-
-	/** Registers the callback invoked after each poll/mutation that may have changed inbox state. */
+/** Registers the callback invoked after each poll/mutation that may have changed inbox state. */
 	public void setInboxListener(Runnable listener)
 	{
 		inboxListener.set(listener);
 	}
-
-	/** @return the most recent unresolved incoming trade from the last poll, or null if none */
-	public TradeInboxItem getPendingAccept()
-	{
-		return pendingAccept.get();
-	}
-
-	/**
+/**
 	 * Creates a trade request to {@code partnerDisplayName} via the cloud API. Dispatches the (blocking)
 	 * network call on the executor, so this method returns immediately; chat feedback, opening the trade
 	 * web page and a forced inbox refresh happen asynchronously once the call completes.
@@ -180,7 +166,7 @@ public final class TradeCloudService
 			{
 				JsonObject result = api.createTrade(partner, accountHash);
 				applyEconomyFieldsFromRpc(result);
-				String url = result.has("url") ? result.get("url").getAsString() : null;
+				String url = JsonObjects.text(result, "url");
 				TcgPluginGameMessages.queuePrefixedGameMessage(chatMessageManager,
 					"Trade request sent to " + partner
 						+ (url == null || url.isEmpty() ? "." : " - finish on the website."));
@@ -212,8 +198,7 @@ public final class TradeCloudService
 			}
 		});
 	}
-
-	/** Chats a mapped failure message for a failed trade mutation, unless the account is locked/banned/quarantined. */
+/** Chats a mapped failure message for a failed trade mutation, unless the account is locked/banned/quarantined. */
 	private void queueTradeFailure(CloudApiException ex)
 	{
 		if (ex != null && (ex.isAccountBanned() || ex.isAccountQuarantined() || session.isAccountLocked()))
@@ -224,8 +209,7 @@ public final class TradeCloudService
 		TcgPluginGameMessages.queuePrefixedGameMessage(chatMessageManager,
 			mapped == null ? "Trade failed." : mapped);
 	}
-
-	/** Schedules the next poll after {@code delayMs}; no-op if stopped. Caller must hold {@link #scheduleLock}. */
+/** Schedules the next poll after {@code delayMs}; no-op if stopped. Caller must hold {@link #scheduleLock}. */
 	private void scheduleNextLocked(long delayMs)
 	{
 		if (!running.get())
@@ -234,8 +218,7 @@ public final class TradeCloudService
 		}
 		pollFuture = scheduler.schedule(this::pollSafe, Math.max(0L, delayMs), TimeUnit.MILLISECONDS);
 	}
-
-	/** Cancels any pending scheduled poll. Caller must hold {@link #scheduleLock}. */
+/** Cancels any pending scheduled poll. Caller must hold {@link #scheduleLock}. */
 	private void cancelScheduledLocked()
 	{
 		if (pollFuture != null)
@@ -244,8 +227,7 @@ public final class TradeCloudService
 			pollFuture = null;
 		}
 	}
-
-	/**
+/**
 	 * Poll-loop entry point: runs {@link #poll()}, computes the next delay (honoring server-suggested
 	 * interval, error backoff, or a queued forced refresh), and reschedules itself. Never throws - all
 	 * poll failures are caught, logged and turned into a backoff delay.
@@ -291,11 +273,9 @@ public final class TradeCloudService
 			}
 		}
 	}
-
-	/**
+/**
 	 * Makes one blocking call to the trade-inbox endpoint, applies any changed sidebar stats/revision, chats
-	 * a ping for newly-notified (or, on first poll after login, all) pending trades, acks notified items,
-	 * and updates {@link #pendingAccept}.
+	 * a ping for newly-notified (or, on first poll after login, all) pending trades, and acks notified items.
 	 *
 	 * @return the server-suggested delay in ms before the next poll
 	 */
@@ -311,28 +291,24 @@ public final class TradeCloudService
 		Long since = knownRevision >= 0L ? knownRevision : null;
 		JsonObject response = api.getTradeInbox(hash, since);
 
-		long pollAfterMs = response.has("pollAfterMs") && !response.get("pollAfterMs").isJsonNull()
-			? response.get("pollAfterMs").getAsLong()
-			: DEFAULT_POLL_MS;
+		long pollAfterMs = JsonObjects.readLong(response, "pollAfterMs", DEFAULT_POLL_MS);
 
-		boolean statsUnchanged = response.has("statsUnchanged")
-			&& !response.get("statsUnchanged").isJsonNull()
-			&& response.get("statsUnchanged").getAsBoolean();
-		if (!statsUnchanged && response.has("stats") && response.get("stats").isJsonObject())
+		if (!JsonObjects.readBoolean(response, "statsUnchanged")
+			&& response.has("stats") && response.get("stats").isJsonObject())
 		{
 			JsonObject stats = response.getAsJsonObject("stats");
 			session.applySidebarStats(stats);
 			session.reconcileCollectionFromInbox(stats);
 		}
 
-		if (response.has("revision") && !response.get("revision").isJsonNull())
+		Double revision = JsonObjects.readNumber(response, "revision");
+		if (revision != null)
 		{
-			lastRevision.set(response.get("revision").getAsLong());
+			lastRevision.set(Math.round(revision));
 		}
 
 		List<TradeInboxItem> inbox = api.parseInbox(response);
 		boolean loginBroadcast = broadcastPendingOnLogin.compareAndSet(true, false);
-		TradeInboxItem newest = null;
 		for (TradeInboxItem item : inbox)
 		{
 			if (loginBroadcast || !item.isNotified())
@@ -340,8 +316,9 @@ public final class TradeCloudService
 				String fromLabel = item.getFromDisplayName() == null || item.getFromDisplayName().isBlank()
 					? "someone"
 					: item.getFromDisplayName().trim();
-				TcgPluginGameMessages.queuePrefixedGameMessage(chatMessageManager,
-					"You have a pending trade request from " + fromLabel + ". Check the sidebar!");
+				TcgPluginGameMessages.queueFormattedGameMessage(chatMessageManager,
+					TcgPluginGameMessages.formatPendingTradeRequest(fromLabel),
+					TcgPluginGameMessages.plainPendingTradeRequest(fromLabel));
 				if (!item.isNotified())
 				{
 					try
@@ -354,45 +331,17 @@ public final class TradeCloudService
 					}
 				}
 			}
-			newest = item;
 		}
-		pendingAccept.set(newest);
 
 		notifyListener();
 		return pollAfterMs;
 	}
-
-	/** Applies any credits/openedPacks/totalCreditsGained/revision fields present on a trade RPC response to session state. */
+/** Applies any credits/openedPacks/totalCreditsGained/revision fields present on a trade RPC response to session state. */
 	private void applyEconomyFieldsFromRpc(JsonObject response)
 	{
-		if (response == null)
-		{
-			return;
-		}
-		if (response.has("credits") || response.has("openedPacks") || response.has("totalCreditsGained"))
-		{
-			JsonObject economy = new JsonObject();
-			if (response.has("credits"))
-			{
-				economy.add("credits", response.get("credits"));
-			}
-			if (response.has("openedPacks"))
-			{
-				economy.add("openedPacks", response.get("openedPacks"));
-			}
-			if (response.has("totalCreditsGained"))
-			{
-				economy.add("totalCreditsGained", response.get("totalCreditsGained"));
-			}
-			session.applySidebarStats(economy);
-		}
-		if (response.has("revision") && !response.get("revision").isJsonNull())
-		{
-			noteRevision(response.get("revision").getAsLong());
-		}
+		CloudResponseSync.applyEconomyAndRevision(response, session::applySidebarStats, this);
 	}
-
-	/** Invokes the registered inbox listener, if any. */
+/** Invokes the registered inbox listener, if any. */
 	private void notifyListener()
 	{
 		Runnable listener = inboxListener.get();
@@ -401,8 +350,7 @@ public final class TradeCloudService
 			listener.run();
 		}
 	}
-
-	/**
+/**
 	 * Chooses the next poll delay for a failed poll based on the error type: re-establishes the session and
 	 * waits {@link #AUTH_RETRY_MS} on 401, exponential backoff on rate limit/server error, otherwise falls
 	 * back to the last known good interval.
@@ -426,8 +374,7 @@ public final class TradeCloudService
 		}
 		return Math.max(DEFAULT_POLL_MS, lastGoodPollAfterMs.get());
 	}
-
-	/** Doubles the current backoff (starting from {@link #DEFAULT_POLL_MS}), capped at {@link #BACKOFF_MAX_MS}. */
+/** Doubles the current backoff (starting from {@link #DEFAULT_POLL_MS}), capped at {@link #BACKOFF_MAX_MS}. */
 	private long nextBackoffDelayMs()
 	{
 		long next = backoffMs.get();

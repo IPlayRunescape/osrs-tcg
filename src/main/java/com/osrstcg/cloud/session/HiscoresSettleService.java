@@ -4,33 +4,34 @@ import com.osrstcg.util.NumberFormatting;
 import com.osrstcg.util.TcgPluginGameMessages;
 import com.google.gson.JsonObject;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.client.chat.ChatMessageManager;
-import net.runelite.client.util.Text;
 import com.osrstcg.cloud.api.CloudApiClient;
 import com.osrstcg.cloud.api.CloudApiException;
+import com.osrstcg.cloud.api.CloudResponseSync;
 import com.osrstcg.cloud.api.JsonObjects;
 import com.osrstcg.cloud.trade.TradeCloudService;
 import javax.inject.Provider;
-
 /**
- * Settles offline hiscores gains into cloud credits once per login, and snapshots hiscores on
- * logout so offline progress since the snapshot can be settled next login. Handles transient
- * {@code hiscores_unavailable} failures with a single delayed retry. Blocking: methods issue
- * synchronous HTTP calls via {@link CloudApiClient} and must not run on the client/EDT thread,
- * except the scheduled retry body which runs on {@link #scheduler}.
+ * Settles offline hiscores gains into cloud credits once per login. Never called on logout —
+ * {@link #clearGate()} cancels any pending retry so a delayed settle cannot fire after disconnect.
+ * Handles transient {@code hiscores_unavailable} failures with a single delayed retry. Blocking:
+ * methods issue synchronous HTTP calls via {@link CloudApiClient} and must not run on the
+ * client/EDT thread, except the scheduled retry body which runs on {@link #scheduler}.
  */
 @Slf4j
 final class HiscoresSettleService
 {
-	private static final long HISCORES_RETRY_DELAY_SEC = 30L;
-
-	private String lastDisplayName;
-
+	private static final long HISCORES_RETRY_DELAY_SEC = 70L;
+	private final CachedDisplayName cachedDisplayName = new CachedDisplayName();
 	private final Client client;
 	private final CloudApiClient api;
 	private final CloudTokenStore tokens;
@@ -41,10 +42,13 @@ final class HiscoresSettleService
 	private final Consumer<JsonObject> applySidebarStats;
 	private final AtomicBoolean hiscoresSettledThisLogin;
 	private final AtomicBoolean hiscoresRetryScheduled;
-	private final java.util.function.BooleanSupplier needsCloudConsent;
-	private final java.util.function.BooleanSupplier isAccountLocked;
-
-	/** Wires collaborators and the shared login/retry flags owned by {@link CloudSessionService}. */
+	private final BooleanSupplier needsCloudConsent;
+	private final BooleanSupplier isAccountLocked;
+/** Bumped by {@link #clearGate()} so in-flight/scheduled retries become no-ops after logout. */
+	private final AtomicLong settleEpoch = new AtomicLong(0L);
+	private final Object retryLock = new Object();
+	private ScheduledFuture<?> retryFuture;
+/** Wires collaborators and the shared login/retry flags owned by {@link CloudSessionService}. */
 	HiscoresSettleService(
 		Client client,
 		CloudApiClient api,
@@ -56,8 +60,8 @@ final class HiscoresSettleService
 		Consumer<JsonObject> applySidebarStats,
 		AtomicBoolean hiscoresSettledThisLogin,
 		AtomicBoolean hiscoresRetryScheduled,
-		java.util.function.BooleanSupplier needsCloudConsent,
-		java.util.function.BooleanSupplier isAccountLocked)
+		BooleanSupplier needsCloudConsent,
+		BooleanSupplier isAccountLocked)
 	{
 		this.client = client;
 		this.api = api;
@@ -72,73 +76,15 @@ final class HiscoresSettleService
 		this.needsCloudConsent = needsCloudConsent;
 		this.isAccountLocked = isAccountLocked;
 	}
-
-	/**
-	 * Records a hiscores snapshot at logout so future gains can be settled next login. No-op if the
-	 * account is locked, consent is pending, no access token, the world is restricted, or the account
-	 * hash/display name aren't known. Failures are logged at debug level and swallowed.
-	 */
-	void snapshotOnLogout()
-	{
-		if (isAccountLocked.getAsBoolean()
-			|| tokens.getAccessToken() == null || needsCloudConsent.getAsBoolean())
-		{
-			return;
-		}
-		if (restrictedWorldGuard != null && restrictedWorldGuard.isRestricted())
-		{
-			return;
-		}
-		long accountHash = client.getAccountHash();
-		if (accountHash == -1L)
-		{
-			return;
-		}
-		String displayName = resolveDisplayName();
-		if (displayName == null)
-		{
-			return;
-		}
-
-		try
-		{
-			JsonObject response = api.settleHiscores(displayName, accountHash, true);
-			if (response != null && response.has("skipped") && !response.get("skipped").isJsonNull()
-				&& response.get("skipped").getAsBoolean())
-			{
-				log.debug("Hiscores logout snapshot skipped: {}",
-					response.has("reason") ? response.get("reason").getAsString() : "skipped");
-				return;
-			}
-			log.debug("Hiscores logout snapshot stored");
-		}
-		catch (CloudApiException ex)
-		{
-			log.debug("Hiscores logout snapshot failed: {} {}", ex.getCode(), ex.getMessage());
-		}
-		catch (Exception ex)
-		{
-			log.debug("Hiscores logout snapshot failed", ex);
-		}
-	}
-
-	/**
-	 * Settles offline hiscores gains since the last snapshot into credits, once per login (guarded by
-	 * {@link #hiscoresSettledThisLogin}). No-op if already settled this login, the account is locked,
-	 * consent is pending, no access token, the world is restricted, or the account hash/display name
-	 * aren't known yet. On error, delegates to {@link #handleSettleError}.
+/**
+	 * Settles offline hiscores gains into credits, once per login (guarded by
+	 * {@link #hiscoresSettledThisLogin}). No-op when not logged into RuneScape (never on logout).
+	 * On error, delegates to {@link #handleSettleError}.
 	 */
 	void settleAfterCloudLogin()
 	{
-		if (hiscoresSettledThisLogin.get())
-		{
-			return;
-		}
-		if (tokens.getAccessToken() == null || needsCloudConsent.getAsBoolean() || isAccountLocked.getAsBoolean())
-		{
-			return;
-		}
-		if (restrictedWorldGuard != null && restrictedWorldGuard.isRestricted())
+		long epoch = settleEpoch.get();
+		if (hiscoresSettledThisLogin.get() || !canSettleNow())
 		{
 			return;
 		}
@@ -147,7 +93,7 @@ final class HiscoresSettleService
 		{
 			return;
 		}
-		String displayName = resolveDisplayName();
+		String displayName = cachedDisplayName.resolve(client);
 		if (displayName == null)
 		{
 			log.debug("Hiscores settle skipped: local player name not ready");
@@ -156,12 +102,23 @@ final class HiscoresSettleService
 
 		try
 		{
+			if (!stillValid(epoch) || !canSettleNow())
+			{
+				return;
+			}
 			JsonObject response = api.settleHiscores(displayName, accountHash);
-			hiscoresSettledThisLogin.set(true);
-			applySettleResponse(response);
+			if (!stillValid(epoch))
+			{
+				return;
+			}
+			handleSettleResponse(response, accountHash, displayName, false);
 		}
 		catch (CloudApiException ex)
 		{
+			if (!stillValid(epoch))
+			{
+				return;
+			}
 			handleSettleError(ex, accountHash, displayName);
 		}
 		catch (Exception ex)
@@ -169,15 +126,71 @@ final class HiscoresSettleService
 			log.warn("Hiscores settle failed", ex);
 		}
 	}
-
-	/** Resets the once-per-login settle gate and retry-scheduled flag (e.g. on logout or lock). */
+/**
+	 * Invalidates settle for this session: bumps the epoch, cancels any pending retry, and resets
+	 * once-per-login flags. Called on logout/disconnect/lock so settle cannot fire afterward.
+	 */
 	void clearGate()
 	{
+		settleEpoch.incrementAndGet();
 		hiscoresSettledThisLogin.set(false);
 		hiscoresRetryScheduled.set(false);
+		cancelRetry();
+	}
+/** True only while logged into RuneScape with tokens/consent/world gates open. */
+	private boolean canSettleNow()
+	{
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			return false;
+		}
+		if (tokens.getAccessToken() == null || needsCloudConsent.getAsBoolean() || isAccountLocked.getAsBoolean())
+		{
+			return false;
+		}
+		return !restrictedWorldGuard.isRestricted();
 	}
 
-	/**
+	private boolean stillValid(long epoch)
+	{
+		return settleEpoch.get() == epoch;
+	}
+/**
+	 * Applies sidebar credits from a settle response. Soft-skip {@code settle_throttle}
+	 * refreshes credits but does not consume the once-per-login gate — a single delayed retry is
+	 * scheduled so the cooldown can clear. Other successes (including {@code hiscores_stale}) mark
+	 * settled.
+	 */
+	private void handleSettleResponse(
+		JsonObject response,
+		long accountHash,
+		String displayName,
+		boolean isRetry)
+	{
+		applySettleResponse(response);
+		if (response == null)
+		{
+			hiscoresSettledThisLogin.set(true);
+			return;
+		}
+
+		boolean skipped = JsonObjects.readBoolean(response, "skipped");
+		String reason = JsonObjects.text(response, "reason");
+		if (reason == null)
+		{
+			reason = "";
+		}
+
+		if (!isRetry && skipped && "settle_throttle".equals(reason))
+		{
+			log.info("Hiscores settle soft-skip ({}); scheduling retry in {}s", reason, HISCORES_RETRY_DELAY_SEC);
+			scheduleRetry(accountHash, displayName, HISCORES_RETRY_DELAY_SEC);
+			return;
+		}
+
+		hiscoresSettledThisLogin.set(true);
+	}
+/**
 	 * Classifies a settle failure: "not found"/forbidden/locked codes are treated as terminal for
 	 * this login (marks settled, no retry); {@code hiscores_unavailable}/503 schedules one retry;
 	 * anything else is just logged.
@@ -206,74 +219,98 @@ final class HiscoresSettleService
 		if ("hiscores_unavailable".equals(code) || status == 503)
 		{
 			log.warn("Hiscores settle unavailable; scheduling one retry: {}", ex.getMessage());
-			scheduleRetry(accountHash, displayName);
+			scheduleRetry(accountHash, displayName, HISCORES_RETRY_DELAY_SEC);
 			return;
 		}
 		log.warn("Hiscores settle failed: {} {}", code, ex.getMessage());
 	}
-
-	/**
+/**
 	 * Schedules a single delayed settle retry (guarded by {@link #hiscoresRetryScheduled} so only one
-	 * retry is ever pending). The retry re-checks preconditions (not already settled, has token,
-	 * consent granted, still the same account) before calling settle again.
+	 * retry is ever pending). The retry re-checks preconditions and the settle epoch before calling
+	 * settle again; {@link #clearGate()} cancels it on logout.
 	 */
-	private void scheduleRetry(long accountHash, String displayName)
+	private void scheduleRetry(long accountHash, String displayName, long delaySec)
 	{
 		if (!hiscoresRetryScheduled.compareAndSet(false, true))
 		{
 			return;
 		}
-		scheduler.schedule(() ->
+		long epoch = settleEpoch.get();
+		ScheduledFuture<?> future = scheduler.schedule(() ->
 		{
 			try
 			{
-				if (hiscoresSettledThisLogin.get()
-					|| tokens.getAccessToken() == null
-					|| needsCloudConsent.getAsBoolean()
+				if (!stillValid(epoch)
+					|| hiscoresSettledThisLogin.get()
+					|| !canSettleNow()
 					|| client.getAccountHash() != accountHash)
 				{
 					return;
 				}
-				String retryName = resolveDisplayName();
+				String retryName = cachedDisplayName.resolve(client);
 				if (retryName == null)
 				{
 					retryName = displayName;
 				}
+				if (retryName == null || !stillValid(epoch) || !canSettleNow())
+				{
+					return;
+				}
 				JsonObject response = api.settleHiscores(retryName, accountHash);
-				hiscoresSettledThisLogin.set(true);
-				applySettleResponse(response);
+				if (!stillValid(epoch))
+				{
+					return;
+				}
+				handleSettleResponse(response, accountHash, retryName, true);
 			}
 			catch (CloudApiException ex)
 			{
+				if (!stillValid(epoch))
+				{
+					return;
+				}
 				hiscoresSettledThisLogin.set(true);
 				log.warn("Hiscores settle retry failed: {} {}", ex.getCode(), ex.getMessage());
 			}
 			catch (Exception ex)
 			{
+				if (!stillValid(epoch))
+				{
+					return;
+				}
 				hiscoresSettledThisLogin.set(true);
 				log.warn("Hiscores settle retry failed", ex);
 			}
-		}, HISCORES_RETRY_DELAY_SEC, TimeUnit.SECONDS);
-	}
-
-	/** Current local player's sanitized name, falling back to the last known name if unavailable. */
-	private String resolveDisplayName()
-	{
-		if (client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
-		{
-			String name = Text.sanitize(client.getLocalPlayer().getName());
-			if (name != null && !name.isEmpty())
+			finally
 			{
-				lastDisplayName = name;
-				return name;
+				synchronized (retryLock)
+				{
+					retryFuture = null;
+				}
 			}
+		}, delaySec, TimeUnit.SECONDS);
+		synchronized (retryLock)
+		{
+			retryFuture = future;
 		}
-		return lastDisplayName;
 	}
 
-	/**
-	 * Applies a settle response's sidebar stats and revision, and posts a chat toast when credits
-	 * were accepted. No-op if the response is null or marked skipped/throttled.
+	private void cancelRetry()
+	{
+		ScheduledFuture<?> future;
+		synchronized (retryLock)
+		{
+			future = retryFuture;
+			retryFuture = null;
+		}
+		if (future != null)
+		{
+			future.cancel(false);
+		}
+	}
+/**
+	 * Applies a settle response's sidebar credits/revision. Posts a chat toast when hiscores credits
+	 * were accepted or clawed back.
 	 */
 	private void applySettleResponse(JsonObject response)
 	{
@@ -281,73 +318,43 @@ final class HiscoresSettleService
 		{
 			return;
 		}
-		if (response.has("skipped") && !response.get("skipped").isJsonNull()
-			&& response.get("skipped").getAsBoolean())
+
+		boolean skipped = JsonObjects.readBoolean(response, "skipped");
+		boolean hasCredits = response.has("credits") && !response.get("credits").isJsonNull();
+
+		if (skipped)
 		{
-			log.debug("Hiscores settle throttled/skipped: {}",
-				response.has("reason") ? response.get("reason").getAsString() : "settle_throttle");
-			return;
+			String reason = JsonObjects.text(response, "reason");
+			if (reason == null)
+			{
+				reason = "settle_throttle";
+			}
+			if (!hasCredits)
+			{
+				log.debug("Hiscores settle throttled/skipped: {}", reason);
+				return;
+			}
+			log.debug("Hiscores settle throttled/skipped (refreshing sidebar credits): {}", reason);
 		}
 
-		applySidebarStats.accept(response);
-		if (response.has("revision") && !response.get("revision").isJsonNull())
-		{
-			tradeCloudProvider.get().noteRevision(response.get("revision").getAsLong());
-		}
+		CloudResponseSync.applyEconomyAndRevision(response, applySidebarStats, tradeCloudProvider.get());
 
-		long accepted = 0L;
-		if (response.has("accepted") && !response.get("accepted").isJsonNull())
-		{
-			accepted = response.get("accepted").getAsLong();
-		}
+		long accepted = JsonObjects.readLong(response, "accepted", 0L);
 		if (accepted > 0L)
 		{
-			String toast = buildToast(accepted, response);
+			String toast = "Automatically credited "
+				+ NumberFormatting.format(accepted)
+				+ " credits based on the hiscores!";
 			TcgPluginGameMessages.queuePrefixedGameMessage(chatMessageManager, toast);
 		}
-	}
 
-	/** Formats the "Offline settle: +N credits (XP x, levels y, activities z)." chat toast text. */
-	private static String buildToast(long accepted, JsonObject response)
-	{
-		StringBuilder sb = new StringBuilder("Offline settle: +");
-		sb.append(NumberFormatting.format(accepted)).append(" credits");
-		if (response.has("breakdown") && response.get("breakdown").isJsonObject())
+		long clawback = JsonObjects.readLong(response, "clawbackCredits", 0L);
+		if (clawback > 0L)
 		{
-			JsonObject b = response.getAsJsonObject("breakdown");
-			long xp = JsonObjects.readLong(b, "xpCredits");
-			long levels = JsonObjects.readLong(b, "levelCredits");
-			long activities = JsonObjects.readLong(b, "activityCredits");
-			if (xp > 0L || levels > 0L || activities > 0L)
-			{
-				sb.append(" (");
-				boolean first = true;
-				if (xp > 0L)
-				{
-					sb.append("XP ").append(NumberFormatting.format(xp));
-					first = false;
-				}
-				if (levels > 0L)
-				{
-					if (!first)
-					{
-						sb.append(", ");
-					}
-					sb.append("levels ").append(NumberFormatting.format(levels));
-					first = false;
-				}
-				if (activities > 0L)
-				{
-					if (!first)
-					{
-						sb.append(", ");
-					}
-					sb.append("activities ").append(NumberFormatting.format(activities));
-				}
-				sb.append(')');
-			}
+			String toast = "Removed "
+				+ NumberFormatting.format(clawback)
+				+ " credits due to hiscores mismatch. If you think this is a mistake, open a ticket.";
+			TcgPluginGameMessages.queuePrefixedGameMessage(chatMessageManager, toast);
 		}
-		sb.append('.');
-		return sb.toString();
 	}
 }

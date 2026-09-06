@@ -7,11 +7,12 @@ import com.osrstcg.state.CardCollectionKey;
 import com.osrstcg.ui.collection.CollectionListModel;
 import com.osrstcg.ui.layout.PackCloseSnapshot;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-
 /**
  * Computes per-booster set-completion progress (owned / foil-owned / total) for the shop and collection
  * tabs, caching each pack's eligible-name set keyed on the current card/roll-pool list identity.
@@ -26,8 +27,7 @@ public final class ShopProgress
 	private ShopProgress()
 	{
 	}
-
-	/** Names of cards owned as a foil (positive quantity, non-blank name), from an owned-card count map. */
+/** Names of cards owned as a foil (positive quantity, non-blank name), from an owned-card count map. */
 	public static Set<String> foilCollectedNamesFromOwned(Map<CardCollectionKey, Integer> owned)
 	{
 		Set<String> foilNames = new HashSet<>();
@@ -52,8 +52,7 @@ public final class ShopProgress
 		}
 		return foilNames;
 	}
-
-	/**
+/**
 	 * Counts owned/foil-owned/total for a booster's eligible card set.
 	 * @return {@code {own, foilOwn, total}}
 	 */
@@ -82,8 +81,7 @@ public final class ShopProgress
 		}
 		return new int[] { own, foilOwn, total };
 	}
-
-	/**
+/**
 	 * Looks up (or computes and caches) the eligible-name set for a booster. The cache is invalidated
 	 * whenever the {@code allCards}/{@code rollPool} list identity changes.
 	 */
@@ -106,13 +104,12 @@ public final class ShopProgress
 			{
 				return cached;
 			}
-			Set<String> eligible = computeEligible(booster, allCards, rollPool);
+			Set<String> eligible = CollectionListModel.eligibleNamesForPack(booster, allCards, rollPool);
 			eligibleByPackKey.put(key, eligible);
 			return eligible;
 		}
 	}
-
-	/** Cache key for a booster: its id, or its category filters when the id is missing/blank. */
+/** Cache key for a booster: its id, or its category filters when the id is missing/blank. */
 	private static String packEligibleKey(BoosterPackDefinition booster)
 	{
 		if (booster == null)
@@ -126,17 +123,7 @@ public final class ShopProgress
 		}
 		return String.valueOf(booster.getCategoryFilters());
 	}
-
-	/** Delegates to {@link CollectionListModel#eligibleNamesForPack} to compute a booster's eligible names. */
-	private static Set<String> computeEligible(
-		BoosterPackDefinition booster,
-		List<CardDefinition> allCards,
-		List<CardDefinition> rollPool)
-	{
-		return CollectionListModel.eligibleNamesForPack(booster, allCards, rollPool);
-	}
-
-	/** Builds one {@link BoosterShopRow} per non-null booster, with progress computed against {@code snap.owned}. */
+/** Builds one {@link BoosterShopRow} per non-null booster, with progress computed against {@code snap.owned}. */
 	public static List<BoosterShopRow> computeRows(
 		PackCloseSnapshot snap,
 		List<CardDefinition> allCards,
@@ -154,5 +141,49 @@ public final class ShopProgress
 			out.add(new BoosterShopRow(booster, p[0], p[1], p[2]));
 		}
 		return out;
+	}
+/**
+	 * Display names of pack collections that became fully owned between {@code ownedBefore} and
+	 * {@code ownedAfter} (same eligibility as {@link #ownedTotal}). Every booster is checked on its
+	 * own eligible set (shared {@code collectionKey} values are not skipped); announcement labels
+	 * are deduped by display name.
+	 */
+	public static List<String> newlyCompletedCollections(
+		Map<CardCollectionKey, Integer> ownedBefore,
+		Map<CardCollectionKey, Integer> ownedAfter,
+		List<CardDefinition> allCards,
+		List<CardDefinition> rollPool,
+		List<BoosterPackDefinition> boosters)
+	{
+		if (boosters == null || boosters.isEmpty())
+		{
+			return Collections.emptyList();
+		}
+		Set<String> names = new LinkedHashSet<>();
+		for (BoosterPackDefinition booster : boosters)
+		{
+			if (booster == null)
+			{
+				continue;
+			}
+			String key = booster.getCollectionKey();
+			if (key == null || key.isBlank())
+			{
+				continue;
+			}
+			int[] before = ownedTotal(booster, allCards, rollPool, ownedBefore);
+			int[] after = ownedTotal(booster, allCards, rollPool, ownedAfter);
+			int total = before[2];
+			if (total <= 0 || before[0] >= total || after[0] < total)
+			{
+				continue;
+			}
+			String display = booster.collectionDisplayName();
+			if (display != null && !display.isBlank())
+			{
+				names.add(display);
+			}
+		}
+		return new ArrayList<>(names);
 	}
 }

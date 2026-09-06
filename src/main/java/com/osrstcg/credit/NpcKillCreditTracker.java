@@ -2,13 +2,18 @@ package com.osrstcg.credit;
 
 import com.google.gson.JsonObject;
 import com.osrstcg.cloud.activity.ActivityConfigService;
+import com.osrstcg.cloud.attest.CreditAttestCoalescer;
 import com.osrstcg.cloud.attest.CreditAttestQueue;
+import com.osrstcg.state.TcgStateService;
+import com.osrstcg.util.NumberFormatting;
+import com.osrstcg.util.TcgPluginGameMessages;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import com.osrstcg.ui.SidebarRefresh;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Actor;
 import net.runelite.api.Client;
 import net.runelite.api.Hitsplat;
@@ -18,17 +23,18 @@ import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.InteractingChanged;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.eventbus.Subscribe;
-
 /**
  * Awards credits for player-caused NPC kills. Tracks which NPCs the player has recently interacted with or
  * hit so a death is only credited when it was actually caused by the player within a short timeout.
  * Subscribes to {@link InteractingChanged}, {@link HitsplatApplied}, {@link ActorDeath}, and {@link GameTick}.
  */
 @Singleton
+@Slf4j
 public final class NpcKillCreditTracker
 {
-	/** Ticks after the last player interaction/hit on an NPC before it's no longer considered engaged. */
+/** Ticks after the last player interaction/hit on an NPC before it's no longer considered engaged. */
 	private static final int INTERACT_TIMEOUT_TICKS = 12;
 
 	private final Client client;
@@ -37,12 +43,13 @@ public final class NpcKillCreditTracker
 	private final CreditAttestQueue attestQueue;
 	private final ActivityConfigService activityConfigService;
 	private final SidebarRefresh sidebarRefresh;
-
-	/** Last known display name per NPC index. */
+	private final TcgStateService stateService;
+	private final ChatMessageManager chatMessageManager;
+/** Last known display name per NPC index. */
 	private final Map<Integer, String> lastKnownNpcName = new ConcurrentHashMap<>();
-	/** Tick of the last player interaction/hit per NPC index, for the engagement timeout. */
+/** Tick of the last player interaction/hit per NPC index, for the engagement timeout. */
 	private final Map<Integer, Integer> lastInteractionTicks = new ConcurrentHashMap<>();
-	/** Whether the player has interacted with or hit the NPC at this index recently enough to credit its death. */
+/** Whether the player has interacted with or hit the NPC at this index recently enough to credit its death. */
 	private final Map<Integer, Boolean> wasNpcEngaged = new ConcurrentHashMap<>();
 
 	@Inject
@@ -52,7 +59,9 @@ public final class NpcKillCreditTracker
 		CreditAwardService creditAwardService,
 		CreditAttestQueue attestQueue,
 		ActivityConfigService activityConfigService,
-		SidebarRefresh sidebarRefresh)
+		SidebarRefresh sidebarRefresh,
+		TcgStateService stateService,
+		ChatMessageManager chatMessageManager)
 	{
 		this.client = client;
 		this.clientThread = clientThread;
@@ -60,17 +69,17 @@ public final class NpcKillCreditTracker
 		this.attestQueue = attestQueue;
 		this.activityConfigService = activityConfigService;
 		this.sidebarRefresh = sidebarRefresh;
+		this.stateService = stateService;
+		this.chatMessageManager = chatMessageManager;
 	}
-
-	/** Clears all tracked NPC interaction state. */
+/** Clears all tracked NPC interaction state. */
 	public void shutdown()
 	{
 		lastKnownNpcName.clear();
 		lastInteractionTicks.clear();
 		wasNpcEngaged.clear();
 	}
-
-	/** Marks an NPC the player has just targeted as engaged, so a fast/one-hit kill still qualifies. */
+/** Marks an NPC the player has just targeted as engaged, so a fast/one-hit kill still qualifies. */
 	@Subscribe
 	public void onInteractingChanged(InteractingChanged event)
 	{
@@ -94,8 +103,7 @@ public final class NpcKillCreditTracker
 			wasNpcEngaged.put(npcIndex, true);
 		}
 	}
-
-	/** Marks an NPC hit by the player's own hitsplat as engaged and refreshes its interaction timeout. */
+/** Marks an NPC hit by the player's own hitsplat as engaged and refreshes its interaction timeout. */
 	@Subscribe
 	public void onHitsplatApplied(HitsplatApplied event)
 	{
@@ -118,8 +126,7 @@ public final class NpcKillCreditTracker
 			wasNpcEngaged.put(npcIndex, true);
 		}
 	}
-
-	/**
+/**
 	 * On an NPC death, awards npc-kill credit if the player was recently engaged with it. Deferred to the
 	 * client thread since engagement state can be checked/cleared from event handlers on the same tick.
 	 */
@@ -143,7 +150,7 @@ public final class NpcKillCreditTracker
 		int npcId = npc.getId();
 		String npcName = normalizeName(lastKnownNpcName.getOrDefault(npcIndex, npc.getName()));
 
-		if (isExcludedNpc(npcId))
+		if (activityConfigService.getCompiled().isExcludedNpc(npcId))
 		{
 			cleanupAfterLogging(npcIndex);
 			return;
@@ -159,7 +166,7 @@ public final class NpcKillCreditTracker
 			{
 				if (Boolean.TRUE.equals(wasNpcEngaged.get(idx)) && isInteractionValid(idx))
 				{
-					enqueueNpcKillCredit(creditAwardService, attestQueue, awardName, combatLevel, awardNpcId);
+					enqueueNpcKillCredit(awardName, combatLevel, awardNpcId);
 					sidebarRefresh.refreshCredits();
 				}
 			}
@@ -169,8 +176,7 @@ public final class NpcKillCreditTracker
 			}
 		});
 	}
-
-	/** Expires stale interaction timestamps once past {@link #INTERACT_TIMEOUT_TICKS}. */
+/** Expires stale interaction timestamps once past {@link #INTERACT_TIMEOUT_TICKS}. */
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
@@ -178,21 +184,19 @@ public final class NpcKillCreditTracker
 		lastInteractionTicks.keySet().removeIf(npcIndex ->
 			(currentTick - lastInteractionTicks.get(npcIndex)) > INTERACT_TIMEOUT_TICKS);
 	}
-
-	/** Enqueues an {@code npc_kill} attest event; optimistic credits equal combat level (1×). */
-	private static void enqueueNpcKillCredit(
-		CreditAwardService creditAwardService,
-		CreditAttestQueue attestQueue,
-		String npcName,
-		int combatLevel,
-		int npcId)
+/**
+	 * Enqueues an {@code npc_kill} attest event; optimistic credits are
+	 * {@code round(combatLevel * killCreditMultiplier)}, defaulting to 1× when unset.
+	 */
+	private void enqueueNpcKillCredit(String npcName, int combatLevel, int npcId)
 	{
 		if (combatLevel <= 0 || creditAwardService.isCreditAwardOnCooldown()
 			|| !creditAwardService.isCreditTrackingAllowed())
 		{
 			return;
 		}
-		long optimisticCredits = combatLevel;
+		double multiplier = activityConfigService.getCompiled().getKillCreditMultiplier(npcId);
+		long optimisticCredits = Math.round(combatLevel * multiplier);
 		if (optimisticCredits <= 0L)
 		{
 			return;
@@ -207,10 +211,28 @@ public final class NpcKillCreditTracker
 		{
 			evidence.addProperty("npcName", npcName);
 		}
-		attestQueue.enqueue("npc_kill", evidence, optimisticCredits);
+		if (!attestQueue.enqueue(CreditAttestCoalescer.TYPE_NPC_KILL, evidence, optimisticCredits))
+		{
+			return;
+		}
+		debugKillQueued(npcName, optimisticCredits);
 	}
-
-	/** Strips RuneLite formatting tags from an NPC name, defaulting to "Unnamed NPC" for {@code null}. */
+/** Debug-chat when an npc kill is queued for attest. */
+	private void debugKillQueued(String npcName, long optimisticCredits)
+	{
+		if (!stateService.isDebugChatEnabled())
+		{
+			return;
+		}
+		String body = String.format(
+			"NPC kill \"%s\" -> +%s credits (total %s)",
+			npcName == null || npcName.isEmpty() ? "Unknown NPC" : npcName,
+			NumberFormatting.format(optimisticCredits),
+			NumberFormatting.format(stateService.getCredits()));
+		log.info("[TCG DEBUG] {}", body);
+		TcgPluginGameMessages.queueDebugGameMessage(chatMessageManager, body);
+	}
+/** Strips RuneLite formatting tags from an NPC name, defaulting to "Unnamed NPC" for {@code null}. */
 	private static String normalizeName(String npcName)
 	{
 		if (npcName == null)
@@ -219,21 +241,13 @@ public final class NpcKillCreditTracker
 		}
 		return npcName.replaceAll("<.*?>", "").trim();
 	}
-
-	/** Whether {@code npcId} is excluded from kill credit by activity config. */
-	private boolean isExcludedNpc(int npcId)
-	{
-		return activityConfigService.getCompiled().isExcludedNpc(npcId);
-	}
-
-	/** Whether the NPC at {@code npcIndex} was interacted with/hit within {@link #INTERACT_TIMEOUT_TICKS}. */
+/** Whether the NPC at {@code npcIndex} was interacted with/hit within {@link #INTERACT_TIMEOUT_TICKS}. */
 	private boolean isInteractionValid(int npcIndex)
 	{
 		Integer lastTick = lastInteractionTicks.get(npcIndex);
 		return lastTick != null && (client.getTickCount() - lastTick) <= INTERACT_TIMEOUT_TICKS;
 	}
-
-	/** Removes tracked interaction state for an NPC index after its death has been handled. */
+/** Removes tracked interaction state for an NPC index after its death has been handled. */
 	private void cleanupAfterLogging(int npcIndex)
 	{
 		lastKnownNpcName.remove(npcIndex);

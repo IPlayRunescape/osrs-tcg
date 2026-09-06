@@ -6,7 +6,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
-
 /** Timer and early-flush scheduling for {@link CreditAttestQueue}. */
 final class CreditAttestScheduler
 {
@@ -15,14 +14,15 @@ final class CreditAttestScheduler
 	private final AtomicLong lastGoodAttestAfterMs;
 	private final AtomicBoolean earlyFlushScheduled;
 	private final AtomicBoolean retryFlushScheduled = new AtomicBoolean(false);
+	private final AtomicBoolean rateCapPaused = new AtomicBoolean(false);
 	private final long defaultAttestAfterMs;
 	private final Runnable flushSafeFalse;
 	private final BooleanSupplier stillRunning;
 	private final Object scheduleLock = new Object();
 	private ScheduledFuture<?> flushFuture;
 	private ScheduledFuture<?> retryFlushFuture;
-
-	/** @param flushSafeFalse invoked to run a non-teardown flush; {@code stillRunning} checked after each tick to decide whether to reschedule */
+	private ScheduledFuture<?> rateCapResumeFuture;
+/** @param flushSafeFalse invoked to run a non-teardown flush; {@code stillRunning} checked after each tick to decide whether to reschedule */
 	CreditAttestScheduler(
 		ScheduledExecutorService scheduler,
 		AtomicBoolean running,
@@ -40,8 +40,7 @@ final class CreditAttestScheduler
 		this.flushSafeFalse = flushSafeFalse;
 		this.stillRunning = stillRunning;
 	}
-
-	/** Starts the periodic flush timer at the default interval, if not already running. Idempotent. */
+/** Starts the periodic flush timer at the default interval, if not already running. Idempotent. */
 	void start()
 	{
 		synchronized (scheduleLock)
@@ -51,25 +50,71 @@ final class CreditAttestScheduler
 				return;
 			}
 			running.set(true);
+			rateCapPaused.set(false);
 			lastGoodAttestAfterMs.set(defaultAttestAfterMs);
 			scheduleNextLocked(lastGoodAttestAfterMs.get());
 		}
 	}
-
-	/** Stops the scheduler and cancels any pending periodic or retry flush. */
+/** Stops the scheduler and cancels any pending periodic, retry, or rate-cap resume flush. */
 	void stop()
 	{
 		synchronized (scheduleLock)
 		{
 			running.set(false);
-			cancelScheduledLocked();
-			cancelRetryFlushLocked();
+			rateCapPaused.set(false);
+			flushFuture = cancel(flushFuture);
+			retryFlushFuture = cancel(retryFlushFuture);
+			retryFlushScheduled.set(false);
+			rateCapResumeFuture = cancel(rateCapResumeFuture);
 		}
 	}
-
-	/** Runs a flush immediately on the executor, coalescing concurrent requests via {@code earlyFlushScheduled}. */
+/** True while a server rate-cap pause is holding periodic/early/retry flushes. */
+	boolean isRateCapPaused()
+	{
+		return rateCapPaused.get();
+	}
+/**
+	 * Cancels periodic and retry flushes and schedules a single resume after {@code delayMs} that
+	 * restarts the normal attest interval. Leaves {@code running} true. No-op if stopped.
+	 */
+	void pauseFor(long delayMs)
+	{
+		synchronized (scheduleLock)
+		{
+			if (!running.get())
+			{
+				return;
+			}
+			rateCapPaused.set(true);
+			flushFuture = cancel(flushFuture);
+			retryFlushFuture = cancel(retryFlushFuture);
+			retryFlushScheduled.set(false);
+			rateCapResumeFuture = cancel(rateCapResumeFuture);
+			rateCapResumeFuture = scheduler.schedule(this::resumeAfterRateCap, Math.max(0L, delayMs), TimeUnit.MILLISECONDS);
+		}
+	}
+/** Clears the rate-cap pause and reschedules the periodic flush using {@code lastGoodAttestAfterMs}. */
+	private void resumeAfterRateCap()
+	{
+		synchronized (scheduleLock)
+		{
+			rateCapResumeFuture = null;
+			if (!running.get())
+			{
+				rateCapPaused.set(false);
+				return;
+			}
+			rateCapPaused.set(false);
+			scheduleNextLocked(lastGoodAttestAfterMs.get());
+		}
+	}
+/** Runs a flush immediately on the executor, coalescing concurrent requests via {@code earlyFlushScheduled}. */
 	void scheduleEarlyFlush()
 	{
+		if (rateCapPaused.get() || !running.get())
+		{
+			return;
+		}
 		if (!earlyFlushScheduled.compareAndSet(false, true))
 		{
 			return;
@@ -78,7 +123,7 @@ final class CreditAttestScheduler
 		{
 			try
 			{
-				flushSafeFalse.run();
+				runFlushIfActive();
 			}
 			finally
 			{
@@ -86,14 +131,13 @@ final class CreditAttestScheduler
 			}
 		});
 	}
-
-	/**
-	 * Schedules a single flush retry after {@code delayMs}, unless the scheduler is stopped or a retry
-	 * is already pending (only one retry flush may be in flight at a time).
+/**
+	 * Schedules a single flush retry after {@code delayMs}, unless the scheduler is stopped, rate-cap
+	 * paused, or a retry is already pending (only one retry flush may be in flight at a time).
 	 */
 	void scheduleRetryFlush(long delayMs)
 	{
-		if (!running.get())
+		if (!running.get() || rateCapPaused.get())
 		{
 			return;
 		}
@@ -103,7 +147,7 @@ final class CreditAttestScheduler
 		}
 		synchronized (scheduleLock)
 		{
-			if (!running.get())
+			if (!running.get() || rateCapPaused.get())
 			{
 				retryFlushScheduled.set(false);
 				return;
@@ -112,7 +156,7 @@ final class CreditAttestScheduler
 			{
 				try
 				{
-					flushSafeFalse.run();
+					runFlushIfActive();
 				}
 				finally
 				{
@@ -125,54 +169,52 @@ final class CreditAttestScheduler
 			}, Math.max(0L, delayMs), TimeUnit.MILLISECONDS);
 		}
 	}
-
-	/** Periodic timer callback: runs a flush, then reschedules itself using the latest attest-after interval. */
+/** Periodic timer callback: runs a flush, then reschedules itself using the latest attest-after interval. */
 	void flushTick()
 	{
 		try
 		{
-			flushSafeFalse.run();
+			if (!rateCapPaused.get())
+			{
+				flushSafeFalse.run();
+			}
 		}
 		finally
 		{
 			synchronized (scheduleLock)
 			{
-				if (stillRunning.getAsBoolean())
+				if (stillRunning.getAsBoolean() && !rateCapPaused.get())
 				{
 					scheduleNextLocked(lastGoodAttestAfterMs.get());
 				}
 			}
 		}
 	}
-
-	/** Schedules the next periodic {@link #flushTick()}; must be called while holding {@link #scheduleLock}. */
+/** Schedules the next periodic {@link #flushTick()}; must be called while holding {@link #scheduleLock}. */
 	private void scheduleNextLocked(long delayMs)
 	{
-		if (!running.get())
+		if (!running.get() || rateCapPaused.get())
 		{
 			return;
 		}
 		flushFuture = scheduler.schedule(this::flushTick, Math.max(0L, delayMs), TimeUnit.MILLISECONDS);
 	}
 
-	/** Cancels the pending periodic flush, if any; must be called while holding {@link #scheduleLock}. */
-	private void cancelScheduledLocked()
+	private void runFlushIfActive()
 	{
-		if (flushFuture != null)
+		if (!rateCapPaused.get() && running.get())
 		{
-			flushFuture.cancel(false);
-			flushFuture = null;
+			flushSafeFalse.run();
 		}
 	}
 
-	/** Cancels the pending retry flush, if any, and clears its scheduled flag; must hold {@link #scheduleLock}. */
-	private void cancelRetryFlushLocked()
+/** Cancels {@code future} if non-null; must hold {@link #scheduleLock}. Returns null for clearing the field. */
+	private static ScheduledFuture<?> cancel(ScheduledFuture<?> future)
 	{
-		if (retryFlushFuture != null)
+		if (future != null)
 		{
-			retryFlushFuture.cancel(false);
-			retryFlushFuture = null;
+			future.cancel(false);
 		}
-		retryFlushScheduled.set(false);
+		return null;
 	}
 }
