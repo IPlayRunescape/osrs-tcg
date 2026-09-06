@@ -29,17 +29,7 @@ public class TcgStateStore
 	{
 		this(stateCodec, null);
 	}
-/** Loads {@code tcg.save} from the current account dir. */
-	public TcgStateLoadResult load()
-	{
-		Optional<TcgState> master = loadMaster();
-		if (master.isPresent())
-		{
-			return new TcgStateLoadResult(master.get(), TcgStateLoadSource.DISK);
-		}
-		return new TcgStateLoadResult(TcgState.empty(), TcgStateLoadSource.EMPTY);
-	}
-/** Loads {@code tcg.save} directly, without the {@link TcgStateLoadResult} wrapper. Empty if none/invalid. */
+/** Loads {@code tcg.save} from the current account dir. Empty if none/invalid. */
 	public Optional<TcgState> loadMaster()
 	{
 		if (fileBackupStore == null)

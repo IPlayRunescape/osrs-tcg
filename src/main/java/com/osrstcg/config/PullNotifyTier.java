@@ -18,11 +18,6 @@ public enum PullNotifyTier
 	{
 		this.tier = tier;
 	}
-/** @return the corresponding {@link RarityMath.Tier}. */
-	public RarityMath.Tier toRarityTier()
-	{
-		return tier;
-	}
 /** @return true if {@code value} is this tier or rarer (higher ordinal). */
 	public boolean meetsOrExceeds(RarityMath.Tier value)
 	{

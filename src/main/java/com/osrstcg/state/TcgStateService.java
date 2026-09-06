@@ -1,8 +1,6 @@
 package com.osrstcg.state;
 
 import com.osrstcg.persist.TcgSaveTrigger;
-import com.osrstcg.persist.TcgStateLoadResult;
-import com.osrstcg.persist.TcgStateLoadSource;
 import com.osrstcg.persist.TcgStateStore;
 import com.osrstcg.util.PackRevealZoomUtil;
 import java.util.List;
@@ -60,18 +58,17 @@ public class TcgStateService
 	}
 /**
 	 * Loads state from {@link #stateStore}, replacing the in-memory state and clearing optimistic
-	 * credits, then applies any pending schema-upgrade fixups. Returns an {@link TcgStateLoadSource#EMPTY}
-	 * result with the current in-memory state if this service was constructed without a store.
+	 * credits, then applies any pending schema-upgrade fixups. No-op (keeps current in-memory state)
+	 * if this service was constructed without a store.
 	 */
-	public synchronized TcgStateLoadResult load()
+	public synchronized void load()
 	{
 		if (stateStore == null)
 		{
-			return new TcgStateLoadResult(state, TcgStateLoadSource.EMPTY);
+			return;
 		}
 
-		TcgStateLoadResult result = stateStore.load();
-		state = result.getState();
+		state = stateStore.loadMaster().orElseGet(TcgState::empty);
 		optimistic.clear();
 		boolean upgradedSkillBaseline = ensureSkillBaselineSchema();
 		ensureProfileMetaSchemaFields();
@@ -79,8 +76,6 @@ public class TcgStateService
 		{
 			state = state.withSkillCreditBaseline(SkillCreditBaseline.absent());
 		}
-
-		return result;
 	}
 /** Ensures the loaded state has a non-null skill credit baseline, defaulting to {@code absent()}. */
 	private boolean ensureSkillBaselineSchema()
@@ -356,20 +351,6 @@ public class TcgStateService
 			return;
 		}
 		state = state.withCollection(state.getCollectionState().withInstancesAdded(instances));
-		notifyCollectionMutated();
-	}
-/** Replaces the entire owned card collection wholesale and notifies collection-mutated listeners. */
-	public synchronized void setCollectionInstances(List<OwnedCardInstance> replacement)
-	{
-		state = state.withCollection(CollectionState.copyOf(replacement == null ? List.of() : replacement));
-		notifyCollectionMutated();
-	}
-/** Resets to a fresh empty state, clears optimistic credits, persists a full checkpoint, and notifies listeners. */
-	public synchronized void resetAll()
-	{
-		optimistic.clear();
-		state = TcgState.empty();
-		saveFullCheckpoint(TcgSaveTrigger.RESET);
 		notifyCollectionMutated();
 	}
 }

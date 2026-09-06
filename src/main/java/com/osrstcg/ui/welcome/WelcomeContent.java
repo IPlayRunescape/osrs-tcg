@@ -2,7 +2,6 @@ package com.osrstcg.ui.welcome;
 
 import java.awt.Color;
 import java.util.List;
-import java.util.Locale;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 /**
@@ -40,8 +39,8 @@ public class WelcomeContent
 		return PARAGRAPHS;
 	}
 /**
-	 * Resolves a paragraph's color string: a handful of named colors, otherwise a hex string
-	 * (with or without a leading {@code #}), falling back to {@link #DEFAULT_COLOR} if blank or unparsable.
+	 * Resolves a paragraph's color string as hex (with or without a leading {@code #}),
+	 * falling back to {@link #DEFAULT_COLOR} if blank or unparsable.
 	 */
 	public static Color resolveColor(String raw)
 	{
@@ -50,22 +49,9 @@ public class WelcomeContent
 			return DEFAULT_COLOR;
 		}
 		String t = raw.trim();
-		String lower = t.toLowerCase(Locale.ROOT);
-		switch (lower)
-		{
-			case "white":
-				return Color.WHITE;
-			case "yellow":
-				return Color.YELLOW;
-			case "red":
-				return Color.RED;
-			case "black":
-				return Color.BLACK;
-			default:
-				break;
-		}
 		try
 		{
+			String lower = t.toLowerCase();
 			if (t.charAt(0) != '#' && !lower.startsWith("0x"))
 			{
 				t = "#" + t;

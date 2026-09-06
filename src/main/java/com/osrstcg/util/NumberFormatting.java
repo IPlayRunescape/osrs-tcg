@@ -13,16 +13,6 @@ public final class NumberFormatting
 	{
 		return formatWithSpaces(value);
 	}
-/** @return space-grouped {@code value}, or {@code "-"} if {@code value} is {@code null}. */
-	public static String format(Long value)
-	{
-		return value == null ? "-" : formatWithSpaces(value);
-	}
-/** @return {@code value} with a space every three digits. */
-	public static String format(int value)
-	{
-		return formatWithSpaces((long) value);
-	}
 /**
 	 * Compact form: {@code "1.2M"} at or above one million, {@code "123k"} at or above 100,000,
 	 * otherwise the same space-grouped format as {@link #format(long)}.

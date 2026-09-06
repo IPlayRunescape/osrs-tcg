@@ -28,7 +28,6 @@ import com.osrstcg.party.TcgCollectionSetCompletePartyMessage;
 import com.osrstcg.party.TcgPartyInboundHandler;
 import com.osrstcg.party.TcgPullPartyMessage;
 import com.osrstcg.persist.TcgSaveTrigger;
-import com.osrstcg.persist.TcgStateLoadResult;
 import com.osrstcg.pack.PackRevealSoundService;
 import com.osrstcg.interop.TcgChatStatsShareService;
 import com.osrstcg.state.TcgStateService;
@@ -440,7 +439,7 @@ public class OsrsTcgPlugin extends Plugin
 		tcgTradeMenuHandler.onMenuOptionClicked(event);
 	}
 /** Resets the XP credit baseline and refreshes the sidebar after a profile's state finishes loading. */
-	private void applyLoadedProfileState(TcgStateLoadResult loadResult)
+	private void applyLoadedProfileState()
 	{
 		creditAwardService.resetExperienceCreditBaseline();
 		tcgPanel.refresh();
@@ -457,8 +456,8 @@ public class OsrsTcgPlugin extends Plugin
 		{
 			return;
 		}
-		TcgStateLoadResult loadResult = stateService.load();
-		applyLoadedProfileState(loadResult);
+		stateService.load();
+		applyLoadedProfileState();
 		loadedAccountHash = accountHash;
 	}
 
