@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
+import java.util.Objects;
 import java.util.stream.Stream;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -22,19 +23,20 @@ public final class CloudSessionFileStore
 {
 	static final String SESSION_FILENAME = "cloud-session.json";
 	private static final int SCHEMA_VERSION = 1;
-	private static final Gson GSON = new Gson();
 
 	private final Path profilesRoot;
+	private final Gson gson;
 
 	@Inject
-	CloudSessionFileStore()
+	CloudSessionFileStore(Gson gson)
 	{
-		this(ProfileKeyHasher.profilesRoot());
+		this(ProfileKeyHasher.profilesRoot(), gson);
 	}
 
-	CloudSessionFileStore(Path profilesRoot)
+	CloudSessionFileStore(Path profilesRoot, Gson gson)
 	{
 		this.profilesRoot = profilesRoot;
+		this.gson = Objects.requireNonNull(gson, "gson");
 	}
 /** Session file path for an account, or {@code null} if the account hash is unset. */
 	Path sessionFile(long accountHash)
@@ -63,7 +65,7 @@ public final class CloudSessionFileStore
 			{
 				return null;
 			}
-			SessionData data = GSON.fromJson(json, SessionData.class);
+			SessionData data = gson.fromJson(json, SessionData.class);
 			if (data == null || blank(data.accessToken) || blank(data.refreshToken))
 			{
 				return null;
@@ -97,7 +99,7 @@ public final class CloudSessionFileStore
 		out.boundAccountHash = accountHash;
 		try
 		{
-			AtomicFiles.writeString(file, GSON.toJson(out), StandardCharsets.UTF_8);
+			AtomicFiles.writeString(file, gson.toJson(out), StandardCharsets.UTF_8);
 		}
 		catch (IOException ex)
 		{

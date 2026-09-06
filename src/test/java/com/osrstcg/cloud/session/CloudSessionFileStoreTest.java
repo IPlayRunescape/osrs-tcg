@@ -6,6 +6,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import com.google.gson.Gson;
 import com.osrstcg.cloud.session.CloudSessionFileStore.SessionData;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -89,7 +90,7 @@ public class CloudSessionFileStoreTest
 
 	private CloudSessionFileStore newStore() throws Exception
 	{
-		return new CloudSessionFileStore(tmp.newFolder("profiles").toPath());
+		return new CloudSessionFileStore(tmp.newFolder("profiles").toPath(), new Gson());
 	}
 
 	private static SessionData session(String access, String refresh, String accountId, String status)
