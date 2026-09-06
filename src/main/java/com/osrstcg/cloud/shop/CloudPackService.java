@@ -11,10 +11,9 @@ import com.osrstcg.state.CloudSidebarCollectionStats;
 import com.osrstcg.state.OwnedCardInstance;
 import com.osrstcg.state.PackCardResult;
 import com.osrstcg.state.PackOpenResult;
-import com.osrstcg.catalog.CollectionSetCompletionUtil;
-import com.osrstcg.catalog.RollPoolFilter;
 import com.osrstcg.party.TcgPartyAnnouncer;
 import com.osrstcg.state.TcgStateService;
+import com.osrstcg.ui.shop.ShopProgress;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -28,15 +27,15 @@ import net.runelite.client.util.Text;
 import com.osrstcg.cloud.api.CloudApiClient;
 import com.osrstcg.cloud.api.CloudApiException;
 import com.osrstcg.cloud.api.CloudResponseSync;
+import com.osrstcg.cloud.api.JsonObjects;
 import com.osrstcg.cloud.attest.CreditAttestQueue;
 import com.osrstcg.cloud.catalog.PackCatalogService;
 import com.osrstcg.cloud.catalog.PackPullParser;
 import com.osrstcg.cloud.session.CloudSessionService;
 import com.osrstcg.cloud.trade.TradeCloudService;
-
 /**
  * Buys a booster pack through the cloud API and applies the resulting pulls, credits and ranks to local state.
- * {@link #buyAndOpenPack(BoosterPackDefinition)} makes a blocking network call and updates shared
+ * {@link #buyAndOpenPack(BoosterPackDefinition, Runnable)} makes a blocking network call and updates shared
  * {@link TcgStateService} state, so callers must invoke it off the client thread and marshal any UI work
  * back onto the client thread themselves.
  */
@@ -53,8 +52,7 @@ public final class CloudPackService
 	private final CardDatabase cardDatabase;
 	private final Client client;
 	private final TcgPartyAnnouncer partyAnnouncer;
-
-	/** Wires cloud/session/state collaborators used to buy and resolve a pack open. */
+/** Wires cloud/session/state collaborators used to buy and resolve a pack open. */
 	@Inject
 	CloudPackService(
 		CloudApiClient api,
@@ -77,24 +75,28 @@ public final class CloudPackService
 		this.client = client;
 		this.partyAnnouncer = partyAnnouncer;
 	}
-
-	/**
+/**
 	 * Buys and opens {@code booster} via the cloud API. Makes a blocking network call - run off the client
 	 * thread. Never throws; failures are reported through the returned {@link PackOpenResult}.
+	 * <p>
+	 * When opening under a pending reveal, pass a non-null {@code beforeOpenRequest} (typically
+	 * {@code packRevealService::armPendingPullsTimeout}) so the UI wait clock arms after local
+	 * flush/pre-work. Pass {@code null} only when no pending-reveal timeout applies.
 	 */
-	public PackOpenResult buyAndOpenPack(BoosterPackDefinition booster)
+	public PackOpenResult buyAndOpenPack(BoosterPackDefinition booster, Runnable beforeOpenRequest)
 	{
-		return buyAndOpenPack(booster, true);
+		return buyAndOpenPack(booster, true, beforeOpenRequest);
 	}
-
-	/**
+/**
 	 * Core buy-and-open flow: validates session/credits/catalog, calls the open-pack endpoint, then updates
 	 * owned cards, credits, sidebar ranks and collection stats from the response.
 	 *
 	 * @param allowCatalogRetry whether a {@code catalog_mismatch} error should trigger one catalog refresh
 	 *                          and a single retry with the refreshed pack definition
+	 * @param beforeOpenRequest optional hook run immediately before each {@code openPack} HTTP call
 	 */
-	private PackOpenResult buyAndOpenPack(BoosterPackDefinition booster, boolean allowCatalogRetry)
+	private PackOpenResult buyAndOpenPack(BoosterPackDefinition booster, boolean allowCatalogRetry,
+		Runnable beforeOpenRequest)
 	{
 		long creditsBefore = stateService.getCredits();
 		if (booster == null)
@@ -157,13 +159,19 @@ public final class CloudPackService
 				ownedBefore = new HashMap<>(stateService.getState().getCollectionState().getOwnedCardsExcludingBeta());
 			}
 
+			if (beforeOpenRequest != null)
+			{
+				beforeOpenRequest.run();
+			}
 			JsonObject response = api.openPack(body);
-			long creditsAfter = response.has("credits")
-				? response.get("credits").getAsLong()
-				: stateService.getAuthoritativeCredits();
-			long totalGained = response.has("totalCreditsGained")
-				? response.get("totalCreditsGained").getAsLong()
-				: stateService.getState().getTotalCreditsGained();
+			Double creditsNum = JsonObjects.readNumber(response, "credits");
+			long creditsAfter = creditsNum == null
+				? stateService.getAuthoritativeCredits()
+				: Math.round(creditsNum);
+			Double gainedNum = JsonObjects.readNumber(response, "totalCreditsGained");
+			long totalGained = gainedNum == null
+				? stateService.getState().getTotalCreditsGained()
+				: Math.round(gainedNum);
 
 			List<PackCardResult> pulls = new ArrayList<>();
 			List<OwnedCardInstance> newInstances = new ArrayList<>();
@@ -222,14 +230,14 @@ public final class CloudPackService
 			{
 				ownedAfter = new HashMap<>(stateService.getState().getCollectionState().getOwnedCards());
 			}
-			List<CardDefinition> rollPool = RollPoolFilter.filterRollPool(cardDatabase.getCards());
-			for (String category : CollectionSetCompletionUtil.newlyCompletedCategories(
-				ownedBefore, ownedAfter, rollPool))
+			List<CardDefinition> allCards = cardDatabase.getCards();
+			for (String collection : ShopProgress.newlyCompletedCollections(
+				ownedBefore, ownedAfter, allCards, allCards, packCatalog.getVisibleBoosters()))
 			{
-				partyAnnouncer.announceSetComplete(category);
+				partyAnnouncer.announceSetComplete(collection);
 			}
 
-			boolean apex = response.has("apex") && response.get("apex").getAsBoolean();
+			boolean apex = JsonObjects.readBoolean(response, "apex");
 			String displayName = priced.getName() == null ? booster.getName() : priced.getName();
 			return PackOpenResult.succeeded(
 				"Pack opened.",
@@ -262,7 +270,7 @@ public final class CloudPackService
 						creditsBefore,
 						booster.getPrice());
 				}
-				return buyAndOpenPack(updated, false);
+				return buyAndOpenPack(updated, false, beforeOpenRequest);
 			}
 			log.warn("Pack open failed: {} {}", ex.getCode(), ex.getMessage());
 			session.noteLockFromApiException(ex);
@@ -281,8 +289,7 @@ public final class CloudPackService
 			return PackOpenResult.failed("Pack open failed: " + ex.getMessage(), creditsBefore, booster.getPrice());
 		}
 	}
-
-	/** Reconciles local credits with the server's reported balance after an insufficient-credits failure. */
+/** Reconciles local credits with the server's reported balance after an insufficient-credits failure. */
 	private void applyInsufficientCreditsFix(CloudApiException ex)
 	{
 		Long serverCredits = ex == null ? null : ex.getServerCredits();
@@ -295,8 +302,7 @@ public final class CloudPackService
 		}
 		refreshCreditsQuietly();
 	}
-
-	/** Refreshes credits from the server, swallowing and logging any failure. */
+/** Refreshes credits from the server, swallowing and logging any failure. */
 	private void refreshCreditsQuietly()
 	{
 		try
@@ -308,8 +314,7 @@ public final class CloudPackService
 			log.warn("Credit refresh after insufficient-credits failed", ex);
 		}
 	}
-
-	/** Applies the optional 6-element {@code ranks} array from a pack-open response to sidebar state, if present and valid. */
+/** Applies the optional 6-element {@code ranks} array from a pack-open response to sidebar state, if present and valid. */
 	private void absorbRanksFromPackOpen(JsonObject response)
 	{
 		if (response == null || !response.has("ranks") || !response.get("ranks").isJsonArray())

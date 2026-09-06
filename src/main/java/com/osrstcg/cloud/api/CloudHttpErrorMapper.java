@@ -1,13 +1,11 @@
 package com.osrstcg.cloud.api;
-
 /** Maps HTTP status / gateway HTML bodies to player-facing CloudApiException messages. */
 final class CloudHttpErrorMapper
 {
 	private CloudHttpErrorMapper()
 	{
 	}
-
-	/**
+/**
 	 * Produces a short player-facing message: a canned message for rate limiting or an
 	 * HTML/gateway body, the trimmed/truncated server message otherwise, or a status-based
 	 * default when the message is blank.
@@ -30,19 +28,12 @@ final class CloudHttpErrorMapper
 		}
 		return cleaned;
 	}
-
-	/** True when {@code text} looks like an HTML error page (e.g. from an nginx gateway) rather than API JSON. */
+/** True when {@code text} looks like an HTML error page (e.g. from an nginx gateway) rather than API JSON. */
 	static boolean looksLikeHtmlOrGatewayPage(String text)
 	{
-		String lower = text.toLowerCase(java.util.Locale.ROOT);
-		return lower.startsWith("<!doctype")
-			|| lower.startsWith("<html")
-			|| lower.contains("<head>")
-			|| lower.contains("<title>")
-			|| lower.contains("nginx/");
+		return !text.isEmpty() && text.charAt(0) == '<';
 	}
-
-	/** Generic player-facing message for an HTTP status when no usable server message is available. */
+/** Generic player-facing message for an HTTP status when no usable server message is available. */
 	static String defaultMessageForHttpStatus(int status)
 	{
 		if (status == 401 || status == 403)
@@ -59,7 +50,7 @@ final class CloudHttpErrorMapper
 		}
 		if (status == 502 || status == 503)
 		{
-			return "Cloud temporarily unavailable - try again.";
+			return "Cloud unavailable - try relogging in a few minutes.";
 		}
 		if (status >= 500)
 		{

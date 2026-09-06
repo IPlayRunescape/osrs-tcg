@@ -11,11 +11,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import static com.osrstcg.cloud.attest.CreditAttestQueue.evidenceInt;
-import static com.osrstcg.cloud.attest.CreditAttestQueue.evidenceLong;
-import static com.osrstcg.cloud.attest.CreditAttestQueue.evidenceObject;
-import static com.osrstcg.cloud.attest.CreditAttestQueue.evidenceString;
-
 /**
  * Stateless helper that merges raw credit-attest events (xp/level-up/npc-kill/activity) into fewer,
  * aggregated wire events, and picks which of those to send first when there are too many for one batch.
@@ -35,6 +30,8 @@ public final class CreditAttestCoalescer
 	public static final String TYPE_ACTIVITY = "activity";
 
 	public static final String CLIENT_OPTIMISTIC_CREDITS = "_optimisticCredits";
+	/** Must match {@code version} in build.gradle / runelite-plugin.properties. */
+	public static final String PLUGIN_VERSION = "1.0.1";
 
 	private static final Set<String> COMBAT_SKILLS_BLOCK_XP = Set.of(
 		"ATTACK", "STRENGTH", "DEFENCE", "RANGED", "MAGIC");
@@ -43,8 +40,7 @@ public final class CreditAttestCoalescer
 	private CreditAttestCoalescer()
 	{
 	}
-
-	/**
+/**
 	 * Aggregates raw events: xp_chunk merges by skill+hour, level_up merges by skill (widening the
 	 * from/to range), npc_kill merges by npc+combat level+hour then splits back into
 	 * {@link #MAX_KILL_AMOUNT}-sized chunks, and activity (and any unrecognized type) passes through
@@ -73,7 +69,7 @@ public final class CreditAttestCoalescer
 			{
 				continue;
 			}
-			JsonObject evidence = evidenceObject(raw);
+			JsonObject evidence = JsonObjects.objectOrEmpty(raw, "evidence");
 			long at = atOf(raw);
 			long optimistic = optimisticOf(raw);
 
@@ -118,31 +114,12 @@ public final class CreditAttestCoalescer
 		{
 			KillKey key = e.getKey();
 			KillAgg agg = e.getValue();
-			int remaining = agg.amount;
-			long optimisticRemaining = agg.optimisticCredits;
-			while (remaining > 0)
-			{
-				int chunk = Math.min(MAX_KILL_AMOUNT, remaining);
-				long chunkOptimistic = remaining <= chunk
-					? optimisticRemaining
-					: (agg.amount <= 0 ? 0L : (agg.optimisticCredits * chunk) / agg.amount);
-				chunkOptimistic = Math.min(chunkOptimistic, optimisticRemaining);
-				out.add(buildKill(key.npcId, key.npcName, key.combatLevel, chunk, agg.lastAt, chunkOptimistic));
-				optimisticRemaining -= chunkOptimistic;
-				remaining -= chunk;
-			}
+			out.addAll(splitKillEvents(key.npcId, key.npcName, key.combatLevel, agg.amount, agg.lastAt, agg.optimisticCredits));
 		}
 		out.addAll(activities);
 		return out;
 	}
-
-	/** Convenience for checking the early-flush threshold without keeping the coalesced result. */
-	public static int estimateCoalescedCount(List<JsonObject> rawEvents)
-	{
-		return coalesce(rawEvents).size();
-	}
-
-	/**
+/**
 	 * Removes up to {@code max} events from {@code coalesced} (mutating it) and returns them as a batch,
 	 * highest {@link #priorityScore} first, so the most valuable credits are sent when a flush can't fit
 	 * everything in one request.
@@ -189,21 +166,18 @@ public final class CreditAttestCoalescer
 		coalesced.addAll(leftover);
 		return batch;
 	}
-
-	/** True for the melee/ranged/magic/defence skills whose xp is never attested directly (kills are instead). */
+/** True for the melee/ranged/magic/defence skills whose xp is never attested directly (kills are instead). */
 	public static boolean isCombatSkillName(String skill)
 	{
 		return COMBAT_SKILLS_BLOCK_XP.contains(normalizeSkillKey(skill));
 	}
-
-	/** True for "HITPOINTS" or any skill name prefixed with it (e.g. boss-specific hitpoints variants). */
+/** True for "HITPOINTS" or any skill name prefixed with it (e.g. boss-specific hitpoints variants). */
 	public static boolean isHitpointsSkillName(String skill)
 	{
 		String key = normalizeSkillKey(skill);
 		return key.equals(HITPOINTS_SKILL_KEY) || key.startsWith(HITPOINTS_SKILL_KEY + " ");
 	}
-
-	/**
+/**
 	 * True if every event in {@code events} is a hitpoints xp_chunk. Used to hold back a batch that
 	 * carries no real credit value (hitpoints xp is never awarded optimistic credits) rather than
 	 * spending a flush cycle on it.
@@ -220,7 +194,7 @@ public final class CreditAttestCoalescer
 			{
 				return false;
 			}
-			String skill = evidenceString(evidenceObject(event), "skill", "");
+			String skill = textOrEmpty(JsonObjects.objectOrEmpty(event, "evidence"), "skill");
 			if (!isHitpointsSkillName(skill))
 			{
 				return false;
@@ -228,8 +202,7 @@ public final class CreditAttestCoalescer
 		}
 		return true;
 	}
-
-	/** Trims and upper-cases a skill name for use as a stable grouping/comparison key; null becomes "". */
+/** Trims and upper-cases a skill name for use as a stable grouping/comparison key; null becomes "". */
 	public static String normalizeSkillKey(String skill)
 	{
 		if (skill == null)
@@ -239,7 +212,12 @@ public final class CreditAttestCoalescer
 		return skill.trim().toUpperCase(Locale.ROOT);
 	}
 
-	/** Floors an epoch-millis timestamp to its hour bucket, clamping negative input to 0. */
+	private static String textOrEmpty(JsonObject o, String key)
+	{
+		String value = JsonObjects.text(o, key);
+		return value == null ? "" : value;
+	}
+/** Floors an epoch-millis timestamp to its hour bucket, clamping negative input to 0. */
 	public static long epochHour(long atMs)
 	{
 		long t = atMs;
@@ -249,16 +227,15 @@ public final class CreditAttestCoalescer
 		}
 		return t / HOUR_MS;
 	}
-
-	/** Adds one xp_chunk's delta into its skill+hour bucket; skips combat skills and non-positive deltas. */
+/** Adds one xp_chunk's delta into its skill+hour bucket; skips combat skills and non-positive deltas. */
 	private static void mergeXp(Map<String, XpAgg> xpBySkillHour, JsonObject evidence, long at, long optimistic)
 	{
-		String skill = evidenceString(evidence, "skill", "");
+		String skill = textOrEmpty(evidence, "skill");
 		if (isCombatSkillName(skill))
 		{
 			return;
 		}
-		long xpDelta = evidenceLong(evidence, "xpDelta", 0L);
+		long xpDelta = JsonObjects.readLong(evidence, "xpDelta");
 		if (xpDelta <= 0L)
 		{
 			return;
@@ -280,13 +257,12 @@ public final class CreditAttestCoalescer
 		agg.optimisticCredits += Math.max(0L, optimistic);
 		agg.lastAt = Math.max(agg.lastAt, at);
 	}
-
-	/** Widens a skill's level-up bucket to cover [min fromLevel, max toLevel]; skips non-progressing entries. */
+/** Widens a skill's level-up bucket to cover [min fromLevel, max toLevel]; skips non-progressing entries. */
 	private static void mergeLevelUp(Map<String, LevelAgg> levelBySkill, JsonObject evidence, long at, long optimistic)
 	{
-		String skill = evidenceString(evidence, "skill", "");
-		int fromLevel = evidenceInt(evidence, "fromLevel", 0);
-		int toLevel = evidenceInt(evidence, "toLevel", 0);
+		String skill = textOrEmpty(evidence, "skill");
+		int fromLevel = JsonObjects.readInt(evidence, "fromLevel");
+		int toLevel = JsonObjects.readInt(evidence, "toLevel");
 		if (toLevel <= fromLevel)
 		{
 			return;
@@ -319,14 +295,13 @@ public final class CreditAttestCoalescer
 		agg.optimisticCredits += Math.max(0L, optimistic);
 		agg.lastAt = Math.max(agg.lastAt, at);
 	}
-
-	/** Adds one npc_kill's amount into its npc+combat-level+hour bucket. */
+/** Adds one npc_kill's amount into its npc+combat-level+hour bucket. */
 	private static void mergeKill(Map<KillKey, KillAgg> kills, JsonObject evidence, long at, long optimistic)
 	{
-		String npcName = evidenceString(evidence, "npcName", "");
-		int combatLevel = evidenceInt(evidence, "combatLevel", 0);
-		int npcId = evidenceInt(evidence, "npcId", 0);
-		int amount = Math.max(1, evidenceInt(evidence, "amount", 1));
+		String npcName = textOrEmpty(evidence, "npcName");
+		int combatLevel = JsonObjects.readInt(evidence, "combatLevel");
+		int npcId = JsonObjects.readInt(evidence, "npcId");
+		int amount = Math.max(1, (int) JsonObjects.readLong(evidence, "amount", 1L));
 		KillKey key = new KillKey(npcId, npcName, combatLevel, epochHour(at));
 		KillAgg agg = kills.get(key);
 		if (agg == null)
@@ -338,24 +313,23 @@ public final class CreditAttestCoalescer
 		agg.optimisticCredits += Math.max(0L, optimistic);
 		agg.lastAt = Math.max(agg.lastAt, at);
 	}
-
-	/** Ranks events for {@link #takePriorityBatch}: level_up highest, then xp_chunk, npc_kill, activity. */
+/** Ranks events for {@link #takePriorityBatch}: level_up highest, then xp_chunk, npc_kill, activity. */
 	private static long priorityScore(JsonObject event)
 	{
 		String type = JsonObjects.text(event, "type");
-		JsonObject evidence = evidenceObject(event);
+		JsonObject evidence = JsonObjects.objectOrEmpty(event, "evidence");
 		if (TYPE_LEVEL_UP.equals(type))
 		{
-			int span = Math.max(0, evidenceInt(evidence, "toLevel", 0) - evidenceInt(evidence, "fromLevel", 0));
+			int span = Math.max(0, JsonObjects.readInt(evidence, "toLevel") - JsonObjects.readInt(evidence, "fromLevel"));
 			return 1_000_000_000L + span * 1_000L;
 		}
 		if (TYPE_XP_CHUNK.equals(type))
 		{
-			return 500_000_000L + Math.min(evidenceLong(evidence, "xpDelta", 0L), 400_000_000L);
+			return 500_000_000L + Math.min(JsonObjects.readLong(evidence, "xpDelta"), 400_000_000L);
 		}
 		if (TYPE_NPC_KILL.equals(type))
 		{
-			return 250_000_000L + Math.min(evidenceInt(evidence, "amount", 1), 200_000_000);
+			return 250_000_000L + Math.min((int) JsonObjects.readLong(evidence, "amount", 1L), 200_000_000);
 		}
 		if (TYPE_ACTIVITY.equals(type))
 		{
@@ -363,8 +337,7 @@ public final class CreditAttestCoalescer
 		}
 		return 1_000L;
 	}
-
-	/** Builds a wire-shaped xp_chunk event from aggregated values. */
+/** Builds a wire-shaped xp_chunk event from aggregated values. */
 	private static JsonObject buildXp(String skill, long xpDelta, long at, long optimisticCredits)
 	{
 		JsonObject evidence = new JsonObject();
@@ -372,8 +345,7 @@ public final class CreditAttestCoalescer
 		evidence.addProperty("xpDelta", xpDelta);
 		return copyEvent(TYPE_XP_CHUNK, evidence, at, optimisticCredits);
 	}
-
-	/** Builds a wire-shaped level_up event from aggregated values. */
+/** Builds a wire-shaped level_up event from aggregated values. */
 	private static JsonObject buildLevelUp(String skill, int fromLevel, int toLevel, long at, long optimisticCredits)
 	{
 		JsonObject evidence = new JsonObject();
@@ -382,8 +354,7 @@ public final class CreditAttestCoalescer
 		evidence.addProperty("toLevel", toLevel);
 		return copyEvent(TYPE_LEVEL_UP, evidence, at, optimisticCredits);
 	}
-
-	/** Builds a wire-shaped npc_kill event from aggregated values; omits npcId/npcName when unset. */
+/** Builds a wire-shaped npc_kill event from aggregated values; omits npcId/npcName when unset. */
 	private static JsonObject buildKill(int npcId, String npcName, int combatLevel, int amount, long at, long optimisticCredits)
 	{
 		JsonObject evidence = new JsonObject();
@@ -400,8 +371,29 @@ public final class CreditAttestCoalescer
 		return copyEvent(TYPE_NPC_KILL, evidence, at, optimisticCredits);
 	}
 
-	/** Assembles a {type, evidence, at, [optimisticCredits]} event, deep-copying the evidence object. */
-	private static JsonObject copyEvent(String type, JsonObject evidence, long at, long optimisticCredits)
+	/** Splits an npc_kill with {@code amount} into {@link #MAX_KILL_AMOUNT}-sized wire events. */
+	static List<JsonObject> splitKillEvents(
+		int npcId, String npcName, int combatLevel, int amount, long at, long optimisticTotal)
+	{
+		List<JsonObject> out = new ArrayList<>();
+		int remaining = amount;
+		long optimisticRemaining = optimisticTotal;
+		while (remaining > 0)
+		{
+			int chunk = Math.min(MAX_KILL_AMOUNT, remaining);
+			long chunkOptimistic = remaining <= chunk
+				? optimisticRemaining
+				: (amount <= 0 ? 0L : (optimisticTotal * chunk) / amount);
+			chunkOptimistic = Math.min(chunkOptimistic, optimisticRemaining);
+			out.add(buildKill(npcId, npcName, combatLevel, chunk, at, chunkOptimistic));
+			optimisticRemaining -= chunkOptimistic;
+			remaining -= chunk;
+		}
+		return out;
+	}
+
+/** Assembles a {type, evidence, at, [optimisticCredits]} event, deep-copying the evidence object. */
+	static JsonObject copyEvent(String type, JsonObject evidence, long at, long optimisticCredits)
 	{
 		JsonObject event = new JsonObject();
 		event.addProperty("type", type);
@@ -413,25 +405,12 @@ public final class CreditAttestCoalescer
 		}
 		return event;
 	}
-
-	/** Reads the client-side optimistic credit estimate stashed on an event, or 0 if absent/invalid. */
+/** Reads the client-side optimistic credit estimate stashed on an event, or 0 if absent/invalid. */
 	public static long optimisticOf(JsonObject event)
 	{
-		if (event == null || !event.has(CLIENT_OPTIMISTIC_CREDITS) || event.get(CLIENT_OPTIMISTIC_CREDITS).isJsonNull())
-		{
-			return 0L;
-		}
-		try
-		{
-			return Math.max(0L, event.get(CLIENT_OPTIMISTIC_CREDITS).getAsLong());
-		}
-		catch (RuntimeException ex)
-		{
-			return 0L;
-		}
+		return Math.max(0L, JsonObjects.readLong(event, CLIENT_OPTIMISTIC_CREDITS));
 	}
-
-	/** Returns a copy of {@code event} with the client-only optimistic-credits field stripped for sending. */
+/** Returns a copy of {@code event} with the client-only optimistic-credits field stripped for sending. */
 	public static JsonObject forWire(JsonObject event)
 	{
 		if (event == null)
@@ -440,20 +419,15 @@ public final class CreditAttestCoalescer
 		}
 		JsonObject copy = event.deepCopy();
 		copy.remove(CLIENT_OPTIMISTIC_CREDITS);
+		copy.addProperty("pluginVersion", PLUGIN_VERSION);
 		return copy;
 	}
-
-	/** Reads an event's {@code at} timestamp, defaulting to now if missing/null. */
+/** Reads an event's {@code at} timestamp, defaulting to now if missing/null. */
 	private static long atOf(JsonObject event)
 	{
-		if (event != null && event.has("at") && !event.get("at").isJsonNull())
-		{
-			return event.get("at").getAsLong();
-		}
-		return System.currentTimeMillis();
+		return JsonObjects.readLong(event, "at", System.currentTimeMillis());
 	}
-
-	/** Running total for one skill+hour xp_chunk bucket. */
+/** Running total for one skill+hour xp_chunk bucket. */
 	private static final class XpAgg
 	{
 		private String emitSkill;
@@ -461,8 +435,7 @@ public final class CreditAttestCoalescer
 		private long lastAt;
 		private long optimisticCredits;
 	}
-
-	/** Widening from/to level range for one skill's level_up bucket. */
+/** Widening from/to level range for one skill's level_up bucket. */
 	private static final class LevelAgg
 	{
 		private String emitSkill;
@@ -471,16 +444,14 @@ public final class CreditAttestCoalescer
 		private long lastAt;
 		private long optimisticCredits;
 	}
-
-	/** Running total for one npc+combat-level+hour npc_kill bucket. */
+/** Running total for one npc+combat-level+hour npc_kill bucket. */
 	private static final class KillAgg
 	{
 		private int amount;
 		private long lastAt;
 		private long optimisticCredits;
 	}
-
-	/** Grouping key for npc_kill aggregation: npc identity, combat level, and hour bucket. */
+/** Grouping key for npc_kill aggregation: npc identity, combat level, and hour bucket. */
 	private static final class KillKey
 	{
 		private final int npcId;
@@ -495,8 +466,7 @@ public final class CreditAttestCoalescer
 			this.combatLevel = combatLevel;
 			this.epochHour = epochHour;
 		}
-
-		/** {@inheritDoc} */
+/** {@inheritDoc} */
 		@Override
 		public boolean equals(Object o)
 		{
@@ -514,16 +484,14 @@ public final class CreditAttestCoalescer
 				&& epochHour == that.epochHour
 				&& Objects.equals(npcName, that.npcName);
 		}
-
-		/** {@inheritDoc} */
+/** {@inheritDoc} */
 		@Override
 		public int hashCode()
 		{
 			return Objects.hash(npcId, npcName, combatLevel, epochHour);
 		}
 	}
-
-	/** An event paired with its index in the source list and its {@link #priorityScore}, for sorting. */
+/** An event paired with its index in the source list and its {@link #priorityScore}, for sorting. */
 	private static final class Scored
 	{
 		private final int index;

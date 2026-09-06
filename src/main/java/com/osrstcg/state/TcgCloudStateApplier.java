@@ -1,23 +1,20 @@
 package com.osrstcg.state;
-
 /** Pure cloud→local state apply used by {@link TcgStateService} under its lock. */
 final class TcgCloudStateApplier
 {
-	/** Static-only helper; not instantiable. */
+/** Static-only helper; not instantiable. */
 	private TcgCloudStateApplier()
 	{
 	}
-
-	/** Applies economy-only fields from a cloud response (credits, opened packs, total gained), clamping to valid ranges. */
+/** Applies economy-only fields from a cloud response (credits, opened packs, total gained). Credits may be negative. */
 	static TcgState applyEconomy(TcgState state, long credits, int openedPacks, long totalCreditsGained)
 	{
 		return state
-			.withCredits(Math.max(0L, credits))
+			.withCredits(credits)
 			.withOpenedPacks(openedPacks)
-			.withTotalCreditsGained(Math.max(totalCreditsGained, credits));
+			.withTotalCreditsGained(Math.max(totalCreditsGained, Math.max(0L, credits)));
 	}
-
-	/** Applies a full cloud state sync (collection, economy, sync markers), substituting empty defaults for nulls. */
+/** Applies a full cloud state sync (collection, economy, sync markers), substituting empty defaults for nulls. */
 	static TcgState applyFull(
 		TcgState state,
 		CollectionState collection,

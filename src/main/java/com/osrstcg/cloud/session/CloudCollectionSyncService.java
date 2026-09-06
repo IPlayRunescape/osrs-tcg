@@ -1,6 +1,7 @@
 package com.osrstcg.cloud.session;
 
 import com.osrstcg.state.CloudSidebarCollectionStats;
+import com.osrstcg.state.CollectionState;
 import com.osrstcg.state.TcgState;
 import com.osrstcg.interop.TcgPublicStatsCalculator;
 import com.osrstcg.state.TcgStateService;
@@ -8,8 +9,8 @@ import com.google.gson.JsonObject;
 import javax.inject.Provider;
 import lombok.extern.slf4j.Slf4j;
 import com.osrstcg.cloud.api.CloudApiClient;
+import com.osrstcg.cloud.api.JsonObjects;
 import com.osrstcg.cloud.attest.CreditAttestQueue;
-
 /**
  * Pulls cloud economy/collection state and reconciles it into local {@link TcgStateService}.
  * Compares local vs server revisions and collection hashes to decide whether a full {@code /me/cards}
@@ -26,8 +27,7 @@ final class CloudCollectionSyncService
 	private final Provider<CreditAttestQueue> attestQueueProvider;
 	private final TcgPublicStatsCalculator publicStatsCalculator;
 	private final CloudCollectionPager pager;
-
-	/** Wires collaborators; no side effects. */
+/** Wires collaborators; no side effects. */
 	CloudCollectionSyncService(
 		CloudSessionService session,
 		CloudApiClient api,
@@ -45,8 +45,7 @@ final class CloudCollectionSyncService
 		this.publicStatsCalculator = publicStatsCalculator;
 		this.pager = pager;
 	}
-
-	/**
+/**
 	 * Updates cached economy (credits/opened packs/total gained) and collection sidebar stats from a
 	 * {@code stats}-shaped response, and applies any account status it carries. No-op if {@code stats}
 	 * is null.
@@ -60,28 +59,31 @@ final class CloudCollectionSyncService
 		boolean hasEconomy = stats.has("credits") || stats.has("openedPacks") || stats.has("totalCreditsGained");
 		if (hasEconomy)
 		{
-			long credits = stats.has("credits")
-				? stats.get("credits").getAsLong()
-				: stateService.getAuthoritativeCredits();
-			int openedPacks = stats.has("openedPacks")
-				? stats.get("openedPacks").getAsInt()
-				: (int) stateService.getState().getEconomyState().getOpenedPacks();
-			long totalGained = stats.has("totalCreditsGained")
-				? stats.get("totalCreditsGained").getAsLong()
-				: stateService.getState().getTotalCreditsGained();
+			Double creditsNum = JsonObjects.readNumber(stats, "credits");
+			long credits = creditsNum == null
+				? stateService.getAuthoritativeCredits()
+				: Math.round(creditsNum);
+			Double openedNum = JsonObjects.readNumber(stats, "openedPacks");
+			int openedPacks = openedNum == null
+				? (int) stateService.getState().getEconomyState().getOpenedPacks()
+				: (int) Math.round(openedNum);
+			Double gainedNum = JsonObjects.readNumber(stats, "totalCreditsGained");
+			long totalGained = gainedNum == null
+				? stateService.getState().getTotalCreditsGained()
+				: Math.round(gainedNum);
 			stateService.replaceCloudEconomyCache(credits, openedPacks, totalGained);
 		}
 		if (CloudSidebarCollectionStats.hasCollectionFields(stats))
 		{
 			stateService.replaceCollectionStatsCache(CloudSidebarCollectionStats.fromStatsJson(stats));
 		}
-		if (stats.has("status") && !stats.get("status").isJsonNull())
+		String status = JsonObjects.text(stats, "status");
+		if (status != null)
 		{
-			session.applyAccountStatus(stats.get("status").getAsString());
+			session.applyAccountStatus(status);
 		}
 	}
-
-	/**
+/**
 	 * Reacts to a push/inbox stats update: logs (does not itself resolve) a mismatch between server
 	 * and locally-computed sidebar counts, then delegates to {@link #reconcileCollectionWithCloud}
 	 * to pull a fresh collection if needed. No-op while cloud consent is pending, or if {@code stats}
@@ -128,40 +130,49 @@ final class CloudCollectionSyncService
 			log.debug("Collection reconcile from inbox failed", e);
 		}
 	}
-
-	/**
+/**
 	 * Flushes any pending credit attests, then re-fetches and applies server stats, clearing the
 	 * local optimistic credit adjustment. No-op if there's no access token, consent is pending, or
 	 * the account is locked.
 	 */
 	void refreshCreditsFromServer() throws Exception
 	{
+		refreshCreditsFromServer(true);
+	}
+/**
+	 * Re-fetches and applies server stats ({@code GET /me/stats}), clearing local optimistic credits.
+	 * When {@code flushFirst} is true, flushes pending attests first. Use {@code flushFirst=false}
+	 * when already inside an attest flush (avoids re-entering the flush gate).
+	 */
+	void refreshCreditsFromServer(boolean flushFirst) throws Exception
+	{
 		if (tokens.getAccessToken() == null || session.needsCloudConsent() || session.isAccountLocked())
 		{
 			return;
 		}
-		try
+		if (flushFirst)
 		{
-			attestQueueProvider.get().flushBlocking();
-		}
-		catch (Exception ex)
-		{
-			log.debug("Attest flush before credit refresh failed", ex);
+			try
+			{
+				attestQueueProvider.get().flushBlocking();
+			}
+			catch (Exception ex)
+			{
+				log.debug("Attest flush before credit refresh failed", ex);
+			}
 		}
 		JsonObject stats = api.getStats();
 		applySidebarStats(stats);
 		stateService.clearOptimisticCredits();
 	}
-
-	/** Fetches server stats, applies them, and reconciles the local collection against the cloud copy. */
+/** Fetches server stats, applies them, and reconciles the local collection against the cloud copy. */
 	void refreshLocalCacheFromCloud() throws Exception
 	{
 		JsonObject stats = api.getStats();
 		applySidebarStats(stats);
 		reconcileCollectionWithCloud(stats);
 	}
-
-	/**
+/**
 	 * Compares local sync markers against {@code stats} and, if the collection hash differs (or the
 	 * legacy revision is behind with no hash to compare), pulls the full player state and cards from
 	 * {@code /me/state} via {@link CloudCollectionPager} and replaces local collection/economy state.
@@ -215,7 +226,7 @@ final class CloudCollectionSyncService
 		}
 		stateService.replaceCloudGroupKey(parsed.groupKey);
 		stateService.replaceFromCloudState(
-			com.osrstcg.state.CollectionState.copyOf(parsed.cards),
+			CollectionState.copyOf(parsed.cards),
 			parsed.economy,
 			parsed.totalCreditsGained,
 			parsed.revision,
@@ -229,8 +240,7 @@ final class CloudCollectionSyncService
 		log.info("Synced collection from cloud (revision={}, cards={}, migratedAtPresent={})",
 			parsed.revision, parsed.cards.size(), parsed.migrated);
 	}
-
-	/** Delegates to {@link CloudCollectionPager#loadCloudPlayerStateWithCards}. */
+/** Delegates to {@link CloudCollectionPager#loadCloudPlayerStateWithCards}. */
 	CloudPlayerStateParser.ParsedCloudPlayerState loadCloudPlayerStateWithCards(JsonObject stateJson) throws Exception
 	{
 		return pager.loadCloudPlayerStateWithCards(stateJson);
