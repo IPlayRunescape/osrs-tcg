@@ -35,7 +35,7 @@ import com.osrstcg.cloud.session.CloudSessionService;
 import com.osrstcg.cloud.trade.TradeCloudService;
 /**
  * Buys a booster pack through the cloud API and applies the resulting pulls, credits and ranks to local state.
- * {@link #buyAndOpenPack(BoosterPackDefinition)} makes a blocking network call and updates shared
+ * {@link #buyAndOpenPack(BoosterPackDefinition, Runnable)} makes a blocking network call and updates shared
  * {@link TcgStateService} state, so callers must invoke it off the client thread and marshal any UI work
  * back onto the client thread themselves.
  */
@@ -78,10 +78,14 @@ public final class CloudPackService
 /**
 	 * Buys and opens {@code booster} via the cloud API. Makes a blocking network call - run off the client
 	 * thread. Never throws; failures are reported through the returned {@link PackOpenResult}.
+	 * <p>
+	 * When opening under a pending reveal, pass a non-null {@code beforeOpenRequest} (typically
+	 * {@code packRevealService::armPendingPullsTimeout}) so the UI wait clock arms after local
+	 * flush/pre-work. Pass {@code null} only when no pending-reveal timeout applies.
 	 */
-	public PackOpenResult buyAndOpenPack(BoosterPackDefinition booster)
+	public PackOpenResult buyAndOpenPack(BoosterPackDefinition booster, Runnable beforeOpenRequest)
 	{
-		return buyAndOpenPack(booster, true);
+		return buyAndOpenPack(booster, true, beforeOpenRequest);
 	}
 /**
 	 * Core buy-and-open flow: validates session/credits/catalog, calls the open-pack endpoint, then updates
@@ -89,8 +93,10 @@ public final class CloudPackService
 	 *
 	 * @param allowCatalogRetry whether a {@code catalog_mismatch} error should trigger one catalog refresh
 	 *                          and a single retry with the refreshed pack definition
+	 * @param beforeOpenRequest optional hook run immediately before each {@code openPack} HTTP call
 	 */
-	private PackOpenResult buyAndOpenPack(BoosterPackDefinition booster, boolean allowCatalogRetry)
+	private PackOpenResult buyAndOpenPack(BoosterPackDefinition booster, boolean allowCatalogRetry,
+		Runnable beforeOpenRequest)
 	{
 		long creditsBefore = stateService.getCredits();
 		if (booster == null)
@@ -153,6 +159,10 @@ public final class CloudPackService
 				ownedBefore = new HashMap<>(stateService.getState().getCollectionState().getOwnedCardsExcludingBeta());
 			}
 
+			if (beforeOpenRequest != null)
+			{
+				beforeOpenRequest.run();
+			}
 			JsonObject response = api.openPack(body);
 			Double creditsNum = JsonObjects.readNumber(response, "credits");
 			long creditsAfter = creditsNum == null
@@ -260,7 +270,7 @@ public final class CloudPackService
 						creditsBefore,
 						booster.getPrice());
 				}
-				return buyAndOpenPack(updated, false);
+				return buyAndOpenPack(updated, false, beforeOpenRequest);
 			}
 			log.warn("Pack open failed: {} {}", ex.getCode(), ex.getMessage());
 			session.noteLockFromApiException(ex);

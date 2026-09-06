@@ -162,8 +162,9 @@ public class PackRevealService
 	}
 /**
 	 * Starts a reveal in {@link Phase#PACK_READY} with placeholder cards, before the server has responded
-	 * with actual pulls. Call {@link #supplyRevealPulls} once the pulls arrive, or {@link #abortPendingReveal}
-	 * if the buy call fails.
+	 * with actual pulls. The pending-pulls timeout is not armed here — call {@link #armPendingPullsTimeout}
+	 * once local pre-work is done and the open-pack HTTP is about to fire. Call {@link #supplyRevealPulls}
+	 * once the pulls arrive, or {@link #abortPendingReveal} if the buy call fails.
 	 */
 	public synchronized void beginPendingReveal(String boosterPackId,
 		boolean apexPackOpen, int expectedCardCount)
@@ -179,10 +180,23 @@ public class PackRevealService
 		initCurrentBatchRevealFlags();
 		this.phaseStartedAt = 0L;
 		this.awaitingServerPulls = true;
-		this.pendingRevealStartedAtMs = System.currentTimeMillis();
+		this.pendingRevealStartedAtMs = 0L;
 		this.pendingPullsTimedOut = false;
 		revealCardResolver.rebuildRarityTierIndex();
 		this.phase = Phase.PACK_READY;
+	}
+/**
+	 * Arms the {@link #PENDING_PULLS_TIMEOUT_MS} clock for an in-flight pending reveal. Call immediately
+	 * before the open-pack HTTP so local flush/pre-work does not consume the wait budget. Idempotent:
+	 * a catalog-mismatch retry must not reset the clock. No-op if already armed, idle, or not awaiting.
+	 */
+	public synchronized void armPendingPullsTimeout()
+	{
+		if (phase == Phase.IDLE || !awaitingServerPulls || pendingRevealStartedAtMs > 0L)
+		{
+			return;
+		}
+		pendingRevealStartedAtMs = System.currentTimeMillis();
 	}
 /** Kicks off async preloading of the card-back and (if resolvable) pack-specific reveal sleeve images. */
 	private void preloadRevealSleeve(String packId)

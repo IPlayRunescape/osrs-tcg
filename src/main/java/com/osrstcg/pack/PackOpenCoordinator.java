@@ -128,7 +128,8 @@ public class PackOpenCoordinator
 		ui.refresh.run();
 		scheduler.execute(() ->
 		{
-			PackOpenResult result = cloudPackService.buyAndOpenPack(booster);
+			PackOpenResult result = cloudPackService.buyAndOpenPack(
+				booster, packRevealService::armPendingPullsTimeout);
 			ui.invokeLater.accept(() ->
 			{
 				try
